@@ -1,0 +1,28 @@
+From bf05df8334070c9d1e51fc343aadf692294b5be3 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 18 Nov 2026 17:01:12 +0300
+Subject: [PATCH] Compose: the host's CPU frequency settings for the
+ performance mode
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ docker-compose.corvid.yml | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/docker-compose.corvid.yml b/docker-compose.corvid.yml
+index dd47daa..af99185 100644
+--- a/docker-compose.corvid.yml
++++ b/docker-compose.corvid.yml
+@@ -15,6 +15,8 @@ services:
+     volumes:
+       - /opt/corvid/config:/core/config
+       - /opt/corvid/data:/core/data
++      # Processor performance mode (Settings → Server): the host's CPU frequency settings.
++      - /sys/devices/system/cpu:/host/sys/cpu
+     environment:
+       NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+       # GeForce cards: the driver caps NVENC sessions (check `nvidia-smi` / your driver).
+-- 
+2.43.0
+

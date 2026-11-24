@@ -1,0 +1,60 @@
+From f58d4bfa8987d4aa8dc9d7849d5d62420daf010a Mon Sep 17 00:00:00 2001
+From: Corvid <corvid@example.invalid>
+Date: Fri, 20 Nov 2026 11:24:41 +0300
+Subject: [PATCH] Image: FFmpeg 9.0.2 (corvid-ffmpeg) by default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ Dockerfile.nvidia | 19 ++++++++++---------
+ 1 file changed, 10 insertions(+), 9 deletions(-)
+
+diff --git a/Dockerfile.nvidia b/Dockerfile.nvidia
+index 131f155..b7f3c3f 100644
+--- a/Dockerfile.nvidia
++++ b/Dockerfile.nvidia
+@@ -4,8 +4,9 @@
+ #   /core/bin/core, /core/ui, /core/config, /core/data, run.sh
+ #   8080/tcp (UI+API), 8181/tcp (HTTPS), 1935/tcp (RTMP), 1936/tcp (RTMPS), 6000/udp (SRT)
+ #
+-# Only the core and the UI are built from the fork sources. FFmpeg stays the official,
+-# datarhei-patched CUDA build (the core needs its JSON progress patch).
++# The core and the UI are built from the fork sources. FFmpeg 9.0 comes from the fork's
++# Dockerfile.ubuntu.corvid (datarhei JSON progress + HLS patches ported to 9.0, NVENC/NVDEC,
++# CUDA filters via clang, no --enable-nonfree: the image is redistributable).
+ #
+ #   docker build -f Dockerfile.nvidia \
+ #     --build-context core=../core --build-context ui=../restreamer-ui -t restreamer:nvidia .
+@@ -13,9 +14,9 @@
+ # Stage names (core-build, ui-build) must differ from the build-context names (core, ui),
+ # otherwise BuildKit resolves "COPY --from=core" to the stage itself.
+ 
+-# FFmpeg 6.1.1 with CUDA filters (built by build.sh from datarhei/ffmpeg, branch 6.1);
+-# the stable UI accepts FFmpeg ^5.1 || ^6.1 only.
+-ARG FFMPEG_IMAGE=restreamer-ffmpeg:6.1.1-cuda
++# FFmpeg with CUDA filters, built by build.sh (default: corvid-ffmpeg:9.0.2; FFMPEG=6 builds
++# the previous 6.1.1 image). The UI accepts FFmpeg 5.1, 6.1, 7, 8 and 9.
++ARG FFMPEG_IMAGE=corvid-ffmpeg:9.0.2
+ ARG GOLANG_IMAGE=golang:1.24-bookworm
+ ARG NODE_IMAGE=node:22-bookworm
+ 
+@@ -51,12 +52,12 @@ COPY ./CHANGELOG.md /core/ui/CHANGELOG.md
+ COPY ./run.sh /core/bin/run.sh
+ COPY ./ui-root /core/ui-root
+ 
+-# The GPU canvas/scale filters need scale_cuda + overlay_cuda, which exist only when FFmpeg is
+-# built with --enable-cuda-nvcc. The stock datarhei/base CUDA images are not: fail loudly here
+-# instead of silently hiding the filters in the UI. (build.sh builds a suitable FFmpeg image.)
++# The GPU canvas/scale filters need scale_cuda + overlay_cuda (FFmpeg built with
++# --enable-cuda-llvm or --enable-cuda-nvcc). The stock datarhei/base CUDA images have neither:
++# fail loudly here instead of silently hiding the filters in the UI.
+ RUN mkdir -p /core/config /core/data && ffmpeg -buildconf && \
+     for f in scale_cuda overlay_cuda; do \
+-      ffmpeg -hide_banner -filters | grep -q " $f " || { echo "ERROR: FFmpeg image has no $f (built without --enable-cuda-nvcc)"; exit 1; }; \
++      ffmpeg -hide_banner -filters | grep -q " $f " || { echo "ERROR: FFmpeg image has no $f (built without CUDA filters)"; exit 1; }; \
+     done
+ 
+ ENV CORE_CONFIGFILE=/core/config/config.json
+-- 
+2.43.0
+

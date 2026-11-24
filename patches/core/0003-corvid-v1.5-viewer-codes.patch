@@ -1,0 +1,399 @@
+From 12d2e282c039f0ae526c40e39d6168e195bbcb01 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 18 Nov 2026 20:33:04 +0300
+Subject: [PATCH] Corvid v1.5: viewer codes for the players
+
+A channel's HLS stream and preview picture can be asked for with a code in
+the path (/memfs/k/<code>/<channel>.m3u8): a viewer's guest key for watching
+the channel, the watch key, or a ticket of the panel (GET /api/v3/fork/hlsticket,
+signed with a key from the JWT secret). Channels listed under
+"protectedPlayers" in the UI's system metadata can only be watched with a
+code; the others stay open.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ app/api/api.go          |  19 ++---
+ http/roles.go           |   2 +-
+ http/server.go          |  14 ++++
+ http/viewerkeys.go      | 154 ++++++++++++++++++++++++++++++++++++++++
+ http/viewerkeys_test.go | 110 ++++++++++++++++++++++++++++
+ 5 files changed, 289 insertions(+), 10 deletions(-)
+ create mode 100644 http/viewerkeys.go
+ create mode 100644 http/viewerkeys_test.go
+
+diff --git a/app/api/api.go b/app/api/api.go
+index 76eea3f..2da3b9b 100644
+--- a/app/api/api.go
++++ b/app/api/api.go
+@@ -1096,15 +1096,16 @@ func (a *api) start() error {
+ 		Cors: http.CorsConfig{
+ 			Origins: cfg.Storage.CORS.Origins,
+ 		},
+-		RTMP:     a.rtmpserver,
+-		SRT:      a.srtserver,
+-		JWT:      a.httpjwt,
+-		Config:   a.config.store,
+-		Sessions: a.sessions,
+-		Router:   router,
+-		ReadOnly: cfg.API.ReadOnly,
+-		Users:    accounts,
+-		CPU:      a.cpu,
++		RTMP:         a.rtmpserver,
++		SRT:          a.srtserver,
++		JWT:          a.httpjwt,
++		Config:       a.config.store,
++		Sessions:     a.sessions,
++		Router:       router,
++		ReadOnly:     cfg.API.ReadOnly,
++		Users:        accounts,
++		CPU:          a.cpu,
++		TicketSecret: cfg.API.Auth.JWT.Secret,
+ 	}
+ 
+ 	mainserverhandler, err := http.NewServer(serverConfig)
+diff --git a/http/roles.go b/http/roles.go
+index c9a254d..160d8b1 100644
+--- a/http/roles.go
++++ b/http/roles.go
+@@ -133,7 +133,7 @@ func (w *capture) Write(b []byte) (int, error) { return w.buf.Write(b) }
+ // protectedMetadata are the fields of the UI's system metadata that only the administrator
+ // may change: the keys. Other roles save the metadata (e.g. canvas templates) with these
+ // fields masked; the stored values are put back.
+-var protectedMetadata = []string{"guestKeys", "watchKey"}
++var protectedMetadata = []string{"guestKeys", "watchKey", "protectedPlayers"}
+ 
+ func (s *server) roleMiddleware() echo.MiddlewareFunc {
+ 	return func(next echo.HandlerFunc) echo.HandlerFunc {
+diff --git a/http/server.go b/http/server.go
+index 9db3f3a..15af37a 100644
+--- a/http/server.go
++++ b/http/server.go
+@@ -100,6 +100,8 @@ type Config struct {
+ 	// Users are the additional accounts and their roles (fork). Optional: without, every
+ 	// logged-in request is the administrator's.
+ 	Users *users.Store
++	// TicketSecret signs the panel's codes for protected players (fork; the JWT secret).
++	TicketSecret string
+ 	// CPU sets the host's CPU frequency governor (fork); nil leaves it out.
+ 	CPU *cpufreq.Manager
+ }
+@@ -117,6 +119,7 @@ type server struct {
+ 
+ 	users    *users.Store
+ 	restream restream.Restreamer
++	tickets  *tickets
+ 
+ 	handler struct {
+ 		about      *api.AboutHandler
+@@ -282,6 +285,7 @@ func NewServer(config Config) (Server, error) {
+ 
+ 	s.users = config.Users
+ 	s.restream = config.Restream
++	s.tickets = newTickets(config.TicketSecret)
+ 	if config.Users != nil {
+ 		s.v3handler.users = api.NewUsers(config.Users)
+ 	}
+@@ -386,6 +390,13 @@ func NewServer(config Config) (Server, error) {
+ 		}
+ 	})
+ 
++	// Fork: viewer codes for the players of the channels (see viewerkeys.go).
++	for _, filesystem := range s.filesystems {
++		if filesystem.Mountpoint == "/memfs" {
++			s.router.Pre(s.viewerGate(filesystem.Mountpoint))
++		}
++	}
++
+ 	s.router.Use(s.middleware.log)
+ 	s.router.Use(middleware.RecoverWithConfig(middleware.RecoverConfig{
+ 		LogErrorFunc: func(c echo.Context, err error, stack []byte) error {
+@@ -726,6 +737,9 @@ func (s *server) setRoutesV3(v3 *echo.Group) {
+ 		v3.POST("/fork/unseal", s.v3handler.users.Unseal)
+ 	}
+ 
++	// v3 code for the panel's own preview of protected players (fork)
++	v3.GET("/fork/hlsticket", s.hlsTicket)
++
+ 	// v3 CPU frequency governor of the host (fork)
+ 	if s.v3handler.cpu != nil {
+ 		v3.GET("/fork/cpu", s.v3handler.cpu.Get)
+diff --git a/http/viewerkeys.go b/http/viewerkeys.go
+new file mode 100644
+index 0000000..ae57790
+--- /dev/null
++++ b/http/viewerkeys.go
+@@ -0,0 +1,154 @@
++package http
++
++// Viewer codes for the player (fork). A channel's HLS stream and preview picture live in the
++// memory filesystem ("/memfs/<channel>.m3u8", "/memfs/<channel>_output_0_12.ts", ...). They can
++// be asked for with a code in the path:
++//
++//	/memfs/k/<code>/<channel>.m3u8
++//
++// Every player fetches the parts of an HLS stream relative to the playlist, so the code goes
++// along with each request without the player knowing about it. A code is a viewer's guest key
++// for watching the channel ("<channel>.stream", mode "play", until it expires), the watch key,
++// or a ticket of the panel (its own preview). A channel listed in the UI's system metadata
++// under "protectedPlayers" can only be watched with a code; the others stay open as before.
++
++import (
++	"crypto/hmac"
++	"crypto/rand"
++	"crypto/sha256"
++	"crypto/subtle"
++	"encoding/hex"
++	"net/http"
++	"regexp"
++	"strconv"
++	"strings"
++	"time"
++
++	"github.com/datarhei/core/v16/guest"
++
++	"github.com/labstack/echo/v4"
++)
++
++var channelOfFile = regexp.MustCompile(`^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})`)
++
++// tickets are the panel's own codes: valid for every channel until they expire. They are signed
++// with a key derived from the given secret (the JWT secret, so they survive a restart), or with
++// a random one if there is none.
++type tickets struct {
++	secret []byte
++}
++
++func newTickets(secret ...string) *tickets {
++	key := make([]byte, 32)
++	if len(secret) != 0 && len(secret[0]) >= 16 {
++		sum := sha256.Sum256([]byte("corvid viewer tickets\x00" + secret[0]))
++		key = sum[:]
++	} else {
++		rand.Read(key)
++	}
++	return &tickets{secret: key}
++}
++
++func (t *tickets) sign(expires int64) string {
++	mac := hmac.New(sha256.New, t.secret)
++	mac.Write([]byte("hls:" + strconv.FormatInt(expires, 10)))
++	return hex.EncodeToString(mac.Sum(nil)[:16])
++}
++
++func (t *tickets) issue(now time.Time, ttl time.Duration) (string, int64) {
++	expires := now.Add(ttl).Unix()
++	return "p" + strconv.FormatInt(expires, 10) + "-" + t.sign(expires), expires
++}
++
++func (t *tickets) valid(ticket string, now time.Time) bool {
++	if !strings.HasPrefix(ticket, "p") {
++		return false
++	}
++	exp, mac, ok := strings.Cut(ticket[1:], "-")
++	if !ok {
++		return false
++	}
++	expires, err := strconv.ParseInt(exp, 10, 64)
++	if err != nil || now.Unix() >= expires {
++		return false
++	}
++	return subtle.ConstantTimeCompare([]byte(mac), []byte(t.sign(expires))) == 1
++}
++
++// viewerMetadata is the UI's system metadata, nil if there is none.
++func (s *server) viewerMetadata() interface{} {
++	if s.restream == nil {
++		return nil
++	}
++	m, err := s.restream.GetMetadata("restreamer-ui")
++	if err != nil {
++		return nil
++	}
++	return m
++}
++
++func protectedPlayer(metadata interface{}, channel string) bool {
++	m, ok := metadata.(map[string]interface{})
++	if !ok {
++		return false
++	}
++	list, _ := m["protectedPlayers"].([]interface{})
++	for _, e := range list {
++		if id, _ := e.(string); id == channel {
++			return true
++		}
++	}
++	return false
++}
++
++func viewerCodeAllowed(metadata interface{}, code, channel string, now time.Time) bool {
++	if guest.Allowed(metadata, code, channel+".stream", false, now) {
++		return true
++	}
++	wk := guest.WatchKey(metadata)
++	return wk != "" && subtle.ConstantTimeCompare([]byte(wk), []byte(code)) == 1
++}
++
++// viewerGate checks viewer codes in memfs paths and takes them out of the path (a Pre
++// middleware: before routing and caching).
++func (s *server) viewerGate(mount string) echo.MiddlewareFunc {
++	prefix := strings.TrimSuffix(mount, "/") + "/"
++	return func(next echo.HandlerFunc) echo.HandlerFunc {
++		return func(c echo.Context) error {
++			req := c.Request()
++			if !strings.HasPrefix(req.URL.Path, prefix) {
++				return next(c)
++			}
++			rest := req.URL.Path[len(prefix):]
++			read := req.Method == http.MethodGet || req.Method == http.MethodHead
++
++			if strings.HasPrefix(rest, "k/") {
++				code, file, ok := strings.Cut(rest[2:], "/")
++				channel := channelOfFile.FindString(file)
++				if !ok || !read || channel == "" || strings.Contains(file, "..") {
++					return echo.NewHTTPError(http.StatusNotFound)
++				}
++				now := time.Now()
++				if !s.tickets.valid(code, now) && !viewerCodeAllowed(s.viewerMetadata(), code, channel, now) {
++					return echo.NewHTTPError(http.StatusForbidden, "This viewer code is not valid (any more).")
++				}
++				req.URL.Path = prefix + file
++				req.URL.RawPath = ""
++				return next(c)
++			}
++
++			if read {
++				if channel := channelOfFile.FindString(rest); channel != "" && protectedPlayer(s.viewerMetadata(), channel) {
++					return echo.NewHTTPError(http.StatusForbidden, "This player needs a viewer code.")
++				}
++			}
++			return next(c)
++		}
++	}
++}
++
++// hlsTicket gives the panel a code for its own preview of protected players.
++func (s *server) hlsTicket(c echo.Context) error {
++	ticket, expires := s.tickets.issue(time.Now(), 7*24*time.Hour)
++	return c.JSON(http.StatusOK, map[string]interface{}{"ticket": ticket, "expires": expires})
++}
+diff --git a/http/viewerkeys_test.go b/http/viewerkeys_test.go
+new file mode 100644
+index 0000000..037535d
+--- /dev/null
++++ b/http/viewerkeys_test.go
+@@ -0,0 +1,110 @@
++package http
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++	"time"
++
++	"github.com/labstack/echo/v4"
++)
++
++const ch = "11111111-2222-4333-8444-555555555555"
++
++func TestTickets(t *testing.T) {
++	tk := newTickets()
++	now := time.Unix(1_800_000_000, 0)
++	ticket, exp := tk.issue(now, time.Hour)
++	if exp != now.Add(time.Hour).Unix() || !tk.valid(ticket, now) {
++		t.Fatal("a fresh ticket must be valid")
++	}
++	if tk.valid(ticket, now.Add(time.Hour)) {
++		t.Fatal("an expired ticket")
++	}
++	if tk.valid(ticket[:len(ticket)-1]+"0", now) && ticket[len(ticket)-1] != '0' {
++		t.Fatal("a changed ticket")
++	}
++	if newTickets().valid(ticket, now) {
++		t.Fatal("another core's ticket")
++	}
++	// with the same secret a ticket survives a restart
++	a, b := newTickets("jwtsecret-0123456789"), newTickets("jwtsecret-0123456789")
++	if tt, _ := a.issue(now, time.Hour); !b.valid(tt, now) || newTickets("other-secret-0123456").valid(tt, now) {
++		t.Fatal("stable tickets")
++	}
++	for _, bad := range []string{"", "p", "p123", "x" + ticket[1:]} {
++		if tk.valid(bad, now) {
++			t.Fatalf("%q", bad)
++		}
++	}
++}
++
++func TestViewerCodes(t *testing.T) {
++	now := time.Now()
++	meta := map[string]interface{}{
++		"protectedPlayers": []interface{}{ch},
++		"watchKey":         "watchkey00000000000000",
++		"guestKeys": []interface{}{
++			map[string]interface{}{"token": "viewer0000000000000001", "name": ch + ".stream", "mode": "play", "expires": float64(now.Add(time.Hour).Unix())},
++			map[string]interface{}{"token": "viewer0000000000000002", "name": ch + ".stream", "mode": "play", "expires": float64(now.Add(-time.Hour).Unix())},
++			map[string]interface{}{"token": "sender0000000000000003", "name": ch + ".stream", "mode": "publish", "expires": float64(now.Add(time.Hour).Unix())},
++		},
++	}
++	if !protectedPlayer(meta, ch) || protectedPlayer(meta, "aaaaaaaa-2222-4333-8444-555555555555") || protectedPlayer(nil, ch) {
++		t.Fatal("protectedPlayer")
++	}
++	cases := map[string]bool{"viewer0000000000000001": true, "viewer0000000000000002": false, "sender0000000000000003": false, "watchkey00000000000000": true, "nothing0000000000000000": false}
++	for code, want := range cases {
++		if got := viewerCodeAllowed(meta, code, ch, now); got != want {
++			t.Errorf("%s: %v", code, got)
++		}
++	}
++	if viewerCodeAllowed(meta, "viewer0000000000000001", "aaaaaaaa-2222-4333-8444-555555555555", now) {
++		t.Error("a code is for its own channel only")
++	}
++}
++
++func TestViewerGate(t *testing.T) {
++	s := &server{tickets: newTickets()}
++	ticket, _ := s.tickets.issue(time.Now(), time.Hour)
++	e := echo.New()
++	served := ""
++	handler := s.viewerGate("/memfs")(func(c echo.Context) error {
++		served = c.Request().URL.Path
++		return c.NoContent(http.StatusOK)
++	})
++	run := func(method, path string) int {
++		served = ""
++		req := httptest.NewRequest(method, path, nil)
++		rec := httptest.NewRecorder()
++		if err := handler(e.NewContext(req, rec)); err != nil {
++			if he, ok := err.(*echo.HTTPError); ok {
++				return he.Code
++			}
++			return 500
++		}
++		return rec.Code
++	}
++
++	// the panel's ticket: the code is taken out of the path
++	if code := run("GET", "/memfs/k/"+ticket+"/"+ch+"_output_0_12.ts"); code != 200 || served != "/memfs/"+ch+"_output_0_12.ts" {
++		t.Fatalf("ticket: %d %q", code, served)
++	}
++	if code := run("GET", "/memfs/k/nothing0000000000000000/"+ch+".m3u8"); code != 403 {
++		t.Fatalf("a wrong code: %d", code)
++	}
++	if code := run("PUT", "/memfs/k/"+ticket+"/"+ch+".m3u8"); code != 404 {
++		t.Fatalf("codes are for reading: %d", code)
++	}
++	if code := run("GET", "/memfs/k/"+ticket+"/other.txt"); code != 404 {
++		t.Fatalf("not a channel's file: %d", code)
++	}
++	// without metadata nothing is protected: open as before
++	if code := run("GET", "/memfs/"+ch+".m3u8"); code != 200 || served != "/memfs/"+ch+".m3u8" {
++		t.Fatalf("open player: %d", code)
++	}
++	// other paths are not touched
++	if code := run("GET", "/api/v3/about"); code != 200 || served != "/api/v3/about" {
++		t.Fatalf("other path: %d", code)
++	}
++}
+-- 
+2.43.0
+

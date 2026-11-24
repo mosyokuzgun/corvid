@@ -1,0 +1,107 @@
+Corvid v1.9.2
+=============
+
+BU GÜNCELLEMEYİ KURMAK (Corvid zaten kuruluysa):
+  Arşivi sunucuya kopyalayın (ör. ~/corvid.rar), sonra:
+
+    sudo mkdir -p /opt/corvid/paket
+    sudo unrar x -o+ ~/corvid.rar /opt/corvid/paket/
+    sudo bash "$(sudo find /opt/corvid/paket -name update.sh | head -n 1)"
+    sudo rm -rf /opt/corvid/paket ~/corvid.rar
+
+  Paket ev klasörüne değil /opt/corvid/paket'e açılır ve kurulumdan sonra silinir. update.sh
+  kendini /opt/corvid/update.sh olarak saklar (yalnızca root okuyup çalıştırabilir); geri alma
+  gibi işlemler için paket gerekmez. Yenilikler: CHANGELOG.md, en üstteki sürüm.
+
+  Aynı "corvid" konteynerinde kurulur; konteyner yalnızca yeniden başlatılır (yayınlar birkaç
+  saniye kesilir, yayın saatine denk getirmeyin). Kurulu sürümle aynı bir paket yeniden
+  başlatmadan geçer; yalnızca paneli değiştiren bir paket de (core ve FFmpeg aynıysa)
+  yeniden başlatmadan kurulur (v1.9 veya üstü kuruluysa v1.9.2 yayınları kesmez).
+
+  Bir sorun olursa:
+    sudo bash /opt/corvid/update.sh --geri-al       bir önceki kurulan sürüme döner
+    sudo bash /opt/corvid/update.sh --eski-ffmpeg   bu sürümde kalır, yalnızca imajdaki FFmpeg
+                                                    6.1.1'e döner (FFmpeg 9'a dönmek için paketi
+                                                    yeniden kurun)
+
+Corvid, datarhei Restreamer ve datarhei Core (Apache License 2.0) temel alınarak geliştirilmiş,
+NVIDIA kodlamalı canlı yayın sunucusudur. datarhei ile bir bağı yoktur.
+Yapılan her şey CHANGELOG.md dosyasında.
+
+Portlar: panel 4501 (http://<sunucu>:4501/ui/), RTMP 1935, SRT 6000/udp. Başka port açılmaz.
+
+
+1) TEMİZ KURULUM
+----------------
+  cd ~ && unzip corvid-v1.zip && cd corvid      (paket ~/corvid klasörüne açılır)
+  sudo bash temiz-kurulum.sh
+
+  Ne olur:
+    1. corvid:v1 imajı derlenir (sunucunun GitHub'a ve ffmpeg.org'a erişmesi gerekir; FFmpeg
+       9.0.2 imajı ilk seferde derlenir, 20-40 dk sürer). Eski kurulum bu sırada YAYINA
+       DEVAM EDER.
+    2. Eski kurulumdan ayarlar, hesaplar, kanallar, yayınlar ve veri klasörü (bekleme
+       görselleri, kayıtlar) /opt/corvid'e kopyalanır. Eski klasörlere dokunulmaz.
+    3. Eski "restreamer" konteyneri durdurulur (silinmez), "corvid" başlatılır.
+       KESİNTİ yalnızca bu adımda (yaklaşık 10-30 sn). Yayın saatine denk getirmeyin.
+    4. Corvid 2 dakika içinde açılmazsa eski kurulum kendiliğinden geri açılır.
+
+  Ne taşınacağını seçmek için:
+    sudo bash temiz-kurulum.sh              her şey (önerilen): giriş, anahtarlar, kanallar
+    sudo bash temiz-kurulum.sh --ayarlar    yalnızca sunucu ayarları ve hesaplar; kanallar boş
+    sudo bash temiz-kurulum.sh --sifirdan   hiçbir şey. Panel parolasız açılır ve dışarıdan
+                                            erişilebilir: kurulum biter bitmez parolayı
+                                            belirleyin, RTMP ve SRT'yi açıp anahtar verin.
+  Kanalları sonradan almak isterseniz: eski panelde Sistem → Yapılandırma ve tanılama →
+  Dışa aktar, Corvid'de aynı yerden İçe aktar.
+
+  Kurulumdan sonra:
+    - Panelde Ctrl+F5. "Hepsi" seçildiyse giriş bilgileri, OBS/kodlayıcı adresleri ve
+      YouTube anahtarları aynı.
+    - Kanalların durumuna bakın; açık olması gerekenleri "Bağlan" ile açın.
+
+  Geri dönmek için:
+    sudo bash temiz-kurulum.sh --geri-don   Corvid durur, eski kurulum açılır.
+
+  ESKİ KALINTILARI SİLMEK (Corvid'den memnun kalınca; geri dönüş imkânı da gider):
+    sudo bash temiz-kurulum.sh --eskiyi-sil
+  Silinecekleri listeler, "SIL" yazınca siler: eski konteyner, restreamer:nvidia imajı,
+  /opt/restreamer, eski derleme klasörü (~/restreamer-build), eski güncelleme paketleri ve
+  ölçüm raporları. Corvid ve FFmpeg imajı kalır. Yalnızca Corvid çalışırken çalışır.
+
+
+2) SONRAKİ GÜNCELLEMELER
+------------------------
+  Yeni paket: yukarıdaki gibi /opt/corvid/paket'e açıp içindeki update.sh ile kurun, sonra silin.
+  Kurulu sistemde (paket gerekmez):
+    sudo bash /opt/corvid/update.sh --geri-al       bir önceki sürüme döner
+    sudo bash /opt/corvid/update.sh --eski-ffmpeg   imajdaki FFmpeg'e döner (core ve panel kalır)
+    sudo bash /opt/corvid/update.sh --kaldir        imajın kendi core/panel/FFmpeg'ine döner
+
+
+3) OBS İÇİNDE CORVID (panel olarak)
+-----------------------------------
+  OBS → Paneller (Docks) → Özel Tarayıcı Panelleri (Custom Browser Docks):
+    Ad:  Corvid
+    URL: http://<sunucu>:4501/ui/#/dock
+  İlk açılışta panel kullanıcı adı ve şifresiyle giriş yapın; OBS bunu hatırlar.
+  Birden çok kanal varsa üstten seçilir; belirli bir kanal için: .../ui/#/dock/<kanal-kimliği>
+  (kimlik, panelde kanal sayfasının adresindeki uzun kod).
+  İçinde: önizleme (göz simgesiyle gizlenir), yayın şeridi, ses seviyesi, Bağlan / Bağlantıyı
+  kes, kayıt, yayınların aç/kapa düğmeleri ve son kontrol. "Bağlantıyı kes" yanlışlıkla
+  basılmasın diye bir kez daha sorar. Düğmeler operatör ve yönetici hesaplarında görünür;
+  "İzleyici" hesabı yalnızca izler.
+
+  Yayın öncesi otomatik kontrol: Sistem → Sunucu → "Yayın öncesi otomatik kontrol" bölümünde
+  saat(ler) ve günler seçilir. Sonuç bu bölümde, ana sayfada (sorun varsa kırmızı şerit) ve
+  OBS panelinde görünür.
+
+
+Dosyalar
+--------
+  temiz-kurulum.sh  kurulum, geri dönüş ve eski kalıntıları silme
+  update.sh         güncellemeyi kurar; kendini /opt/corvid/update.sh olarak saklar
+  CHANGELOG.md      ilk günden bugüne değişiklikler
+  kaynak/           imajın kaynağı: build.sh ve datarhei koduna uygulanan yamalar
+  bin/, ui/, ui-root/  update.sh'nin kurduğu core, panel ve kök adres sayfası
+  ffmpeg/           update.sh'nin kurduğu FFmpeg 9.0.2 ve kütüphaneleri (overlay/bin/ffmpeg9)

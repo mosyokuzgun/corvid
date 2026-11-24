@@ -1,0 +1,667 @@
+From e40b37304eeafb478198b36377eeecd52369df29 Mon Sep 17 00:00:00 2001
+From: Corvid <corvid@example.invalid>
+Date: Mon, 23 Nov 2026 13:48:28 +0300
+Subject: [PATCH] Corvid v1.8: line quality of the streams sent to this server
+
+New package linehealth: for every RTMP and SRT publisher (keys
+"rtmp:<name>", "srt:<resource>") the last 10 minutes of gaps (>= 1 s
+without data) and dropped connections (a publisher that came back within
+a minute; one that stays away was stopped on purpose). Levels: good,
+unstable, bad (2 drops, 10 s without data in total, a 5 s gap or a 5 s
+stall right now). The history survives configuration reloads.
+
+GET /api/v3/fork/linehealth.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ app/api/api.go                |  10 ++
+ http/server.go                |  18 +++
+ linehealth/linehealth.go      | 240 ++++++++++++++++++++++++++++++++++
+ linehealth/linehealth_test.go | 116 ++++++++++++++++
+ rtmp/rtmp.go                  |  26 +++-
+ srt/srt.go                    |  27 +++-
+ 6 files changed, 434 insertions(+), 3 deletions(-)
+ create mode 100644 linehealth/linehealth.go
+ create mode 100644 linehealth/linehealth_test.go
+
+diff --git a/app/api/api.go b/app/api/api.go
+index 84c0f83..624529b 100644
+--- a/app/api/api.go
++++ b/app/api/api.go
+@@ -33,6 +33,7 @@ import (
+ 	"github.com/datarhei/core/v16/http/jwt"
+ 	"github.com/datarhei/core/v16/http/router"
+ 	"github.com/datarhei/core/v16/io/fs"
++	"github.com/datarhei/core/v16/linehealth"
+ 	"github.com/datarhei/core/v16/log"
+ 	"github.com/datarhei/core/v16/math/rand"
+ 	"github.com/datarhei/core/v16/monitor"
+@@ -82,6 +83,7 @@ type api struct {
+ 	s3fs          map[string]fs.Filesystem
+ 	rtmpserver    rtmp.Server
+ 	failover      *rtmp.SettingsStore
++	lineHealth    *linehealth.Monitor
+ 	srtserver     srt.Server
+ 	metrics       monitor.HistoryMonitor
+ 	prom          prometheus.Metrics
+@@ -658,6 +660,11 @@ func (a *api) start() error {
+ 
+ 	a.restream = restream
+ 
++	// Fork: line quality of the publishers, kept across reloads of the configuration.
++	if a.lineHealth == nil {
++		a.lineHealth = linehealth.New()
++	}
++
+ 	// Fork: the host's CPU governor chosen in the panel, applied again at every start.
+ 	if a.cpu == nil {
+ 		a.cpu = cpufreq.New(filepath.Join(cfg.DB.Dir, "cpu.json"))
+@@ -947,6 +954,7 @@ func (a *api) start() error {
+ 			Logger:                a.log.logger.rtmp,
+ 			ConnectionIdleTimeout: 10 * time.Second,
+ 			Collector:             a.sessions.Collector("rtmp"),
++			LineHealth:            a.lineHealth,
+ 		}
+ 
+ 		// Seamless failover to "<channel>_fallback.stream" (fork). CORE_RTMP_FAILOVER=false disables it.
+@@ -999,6 +1007,7 @@ func (a *api) start() error {
+ 			WatchKey:   a.watchKey,
+ 			Logger:     a.log.logger.core.WithComponent("SRT").WithField("address", cfg.SRT.Address),
+ 			Collector:  a.sessions.Collector("srt"),
++			LineHealth: a.lineHealth,
+ 		}
+ 
+ 		if cfg.SRT.Log.Enable {
+@@ -1113,6 +1122,7 @@ func (a *api) start() error {
+ 		Users:        accounts,
+ 		CPU:          a.cpu,
+ 		Failover:     a.failover,
++		LineHealth:   a.lineHealth,
+ 		TicketSecret: cfg.API.Auth.JWT.Secret,
+ 	}
+ 
+diff --git a/http/server.go b/http/server.go
+index f8f47e4..912f97f 100644
+--- a/http/server.go
++++ b/http/server.go
+@@ -46,6 +46,7 @@ import (
+ 	"github.com/datarhei/core/v16/http/jwt"
+ 	"github.com/datarhei/core/v16/http/router"
+ 	"github.com/datarhei/core/v16/http/validator"
++	"github.com/datarhei/core/v16/linehealth"
+ 	"github.com/datarhei/core/v16/log"
+ 	"github.com/datarhei/core/v16/monitor"
+ 	"github.com/datarhei/core/v16/net"
+@@ -107,6 +108,9 @@ type Config struct {
+ 
+ 	// Failover settings of the RTMP server (fork), nil if RTMP is off.
+ 	Failover *rtmp.SettingsStore
++
++	// Line quality of the RTMP/SRT publishers (fork).
++	LineHealth *linehealth.Monitor
+ }
+ 
+ type CorsConfig struct {
+@@ -124,6 +128,8 @@ type server struct {
+ 	restream restream.Restreamer
+ 	tickets  *tickets
+ 
++	lineHealth *linehealth.Monitor
++
+ 	handler struct {
+ 		about      *api.AboutHandler
+ 		prometheus *handler.PrometheusHandler
+@@ -290,6 +296,7 @@ func NewServer(config Config) (Server, error) {
+ 	s.users = config.Users
+ 	s.restream = config.Restream
+ 	s.tickets = newTickets(config.TicketSecret)
++	s.lineHealth = config.LineHealth
+ 	if config.Users != nil {
+ 		s.v3handler.users = api.NewUsers(config.Users)
+ 	}
+@@ -756,6 +763,17 @@ func (s *server) setRoutesV3(v3 *echo.Group) {
+ 		}
+ 	}
+ 
++	// v3 line quality of the streams sent to this server (fork)
++	if s.lineHealth != nil {
++		v3.GET("/fork/linehealth", func(c echo.Context) error {
++			return c.JSON(http.StatusOK, map[string]interface{}{
++				"window_seconds":  int(linehealth.Window.Seconds()),
++				"min_gap_seconds": linehealth.MinGap.Seconds(),
++				"streams":         s.lineHealth.Reports(),
++			})
++		})
++	}
++
+ 	// v3 RTMP failover: when viewers move to the backup and to the waiting picture (fork)
+ 	if s.v3handler.failover != nil {
+ 		v3.GET("/fork/failover", s.v3handler.failover.Get)
+diff --git a/linehealth/linehealth.go b/linehealth/linehealth.go
+new file mode 100644
+index 0000000..34e8959
+--- /dev/null
++++ b/linehealth/linehealth.go
+@@ -0,0 +1,240 @@
++// Package linehealth keeps a short history of how evenly the streams that are sent to this
++// server (RTMP, SRT publishers) arrive: gaps without data and dropped connections that came
++// back. The panel shows it as "line quality" of a channel's source and backup (fork).
++package linehealth
++
++import (
++	"sort"
++	"sync"
++	"time"
++)
++
++const (
++	// Window is how far back the history goes.
++	Window = 10 * time.Minute
++	// MinGap is the shortest pause without data that counts as a gap.
++	MinGap = time.Second
++	// ReconnectWithin: a publisher that comes back within this time after a disconnect
++	// counts as a dropped connection. One that stays away was stopped on purpose.
++	ReconnectWithin = time.Minute
++)
++
++// Levels of a report.
++const (
++	LevelGood     = "good"
++	LevelUnstable = "unstable"
++	LevelBad      = "bad"
++)
++
++type event struct {
++	at  time.Time
++	gap time.Duration // 0 for a dropped connection
++}
++
++type stream struct {
++	mu           sync.Mutex
++	connected    int // publishers (normally 0 or 1)
++	since        time.Time
++	last         time.Time
++	disconnected time.Time
++	gapBefore    time.Duration // silence before the last disconnect
++	events       []event
++}
++
++// Monitor keeps the history of all streams. The zero value is not usable, see New.
++type Monitor struct {
++	mu      sync.Mutex
++	streams map[string]*stream
++	now     func() time.Time
++}
++
++func New() *Monitor {
++	return &Monitor{streams: map[string]*stream{}, now: time.Now}
++}
++
++// Handle belongs to one publisher connection. A nil *Handle does nothing.
++type Handle struct {
++	m *Monitor
++	s *stream
++}
++
++// Connect registers a publisher of the stream key (e.g. "srt:channel.stream").
++func (m *Monitor) Connect(key string) *Handle {
++	if m == nil {
++		return nil
++	}
++
++	m.mu.Lock()
++	s := m.streams[key]
++	if s == nil {
++		s = &stream{}
++		m.streams[key] = s
++	}
++	m.mu.Unlock()
++
++	now := m.now()
++
++	s.mu.Lock()
++	if !s.disconnected.IsZero() && s.connected == 0 && now.Sub(s.disconnected) <= ReconnectWithin {
++		// It came back: the last disconnect was a drop, and the silence before it a gap.
++		if s.gapBefore >= MinGap {
++			s.events = append(s.events, event{at: s.disconnected, gap: s.gapBefore})
++		}
++		s.events = append(s.events, event{at: s.disconnected})
++	}
++	s.disconnected = time.Time{}
++	s.connected++
++	s.since = now
++	s.last = now
++	s.prune(now)
++	s.mu.Unlock()
++
++	return &Handle{m: m, s: s}
++}
++
++// Data notes that data arrived.
++func (h *Handle) Data() {
++	if h == nil {
++		return
++	}
++
++	now := h.m.now()
++	s := h.s
++
++	s.mu.Lock()
++	if d := now.Sub(s.last); d >= MinGap {
++		s.events = append(s.events, event{at: now, gap: d})
++		s.prune(now)
++	}
++	s.last = now
++	s.mu.Unlock()
++}
++
++// Close notes that the publisher disconnected.
++func (h *Handle) Close() {
++	if h == nil {
++		return
++	}
++
++	now := h.m.now()
++	s := h.s
++
++	s.mu.Lock()
++	if s.connected > 0 {
++		s.connected--
++	}
++	if s.connected == 0 {
++		s.disconnected = now
++		s.gapBefore = now.Sub(s.last)
++	}
++	s.mu.Unlock()
++}
++
++func (s *stream) prune(now time.Time) {
++	i := 0
++	for i < len(s.events) && now.Sub(s.events[i].at) > Window {
++		i++
++	}
++	if i > 0 {
++		s.events = append(s.events[:0], s.events[i:]...)
++	}
++}
++
++// Report is the line quality of one stream over the last Window.
++type Report struct {
++	Connected        bool    `json:"connected"`
++	ConnectedSeconds float64 `json:"connected_seconds"`
++	// StalledSeconds: how long it has been sending nothing right now (connected, >= MinGap).
++	StalledSeconds float64 `json:"stalled_seconds"`
++	Drops          int     `json:"drops"`
++	Gaps           int     `json:"gaps"`
++	LongestGapMs   int64   `json:"longest_gap_ms"`
++	TotalGapMs     int64   `json:"total_gap_ms"`
++	// LastEventAgoSeconds: how long ago the last gap or drop was, -1 if none.
++	LastEventAgoSeconds float64 `json:"last_event_ago_seconds"`
++	Level               string  `json:"level"`
++}
++
++// Level: bad from 2 drops, 10 s without data in total, a 5 s gap or a stall of 5 s;
++// unstable with any gap, drop or a current stall; good otherwise.
++func level(r Report) string {
++	if r.Drops >= 2 || r.TotalGapMs >= 10000 || r.LongestGapMs >= 5000 || r.StalledSeconds >= 5 {
++		return LevelBad
++	}
++	if r.Drops > 0 || r.Gaps > 0 || r.StalledSeconds >= MinGap.Seconds() {
++		return LevelUnstable
++	}
++	return LevelGood
++}
++
++func (s *stream) report(now time.Time) Report {
++	s.prune(now)
++
++	r := Report{Connected: s.connected > 0, LastEventAgoSeconds: -1}
++	if r.Connected {
++		r.ConnectedSeconds = now.Sub(s.since).Seconds()
++		if d := now.Sub(s.last); d >= MinGap {
++			r.StalledSeconds = d.Seconds()
++		}
++	}
++
++	for _, e := range s.events {
++		if e.gap == 0 {
++			r.Drops++
++		} else {
++			r.Gaps++
++			ms := e.gap.Milliseconds()
++			r.TotalGapMs += ms
++			if ms > r.LongestGapMs {
++				r.LongestGapMs = ms
++			}
++		}
++	}
++	if n := len(s.events); n > 0 {
++		r.LastEventAgoSeconds = now.Sub(s.events[n-1].at).Seconds()
++	}
++
++	r.Level = level(r)
++	return r
++}
++
++// Reports returns the streams that are connected or had something happen in the window.
++func (m *Monitor) Reports() map[string]Report {
++	reports := map[string]Report{}
++	if m == nil {
++		return reports
++	}
++
++	now := m.now()
++
++	m.mu.Lock()
++	keys := make([]string, 0, len(m.streams))
++	for k := range m.streams {
++		keys = append(keys, k)
++	}
++	sort.Strings(keys)
++	streams := make([]*stream, len(keys))
++	for i, k := range keys {
++		streams[i] = m.streams[k]
++	}
++	m.mu.Unlock()
++
++	for i, s := range streams {
++		s.mu.Lock()
++		r := s.report(now)
++		gone := s.connected == 0 && len(s.events) == 0 && (s.disconnected.IsZero() || now.Sub(s.disconnected) > ReconnectWithin)
++		s.mu.Unlock()
++
++		if gone {
++			m.mu.Lock()
++			if m.streams[keys[i]] == s {
++				delete(m.streams, keys[i])
++			}
++			m.mu.Unlock()
++			continue
++		}
++		reports[keys[i]] = r
++	}
++
++	return reports
++}
+diff --git a/linehealth/linehealth_test.go b/linehealth/linehealth_test.go
+new file mode 100644
+index 0000000..6609284
+--- /dev/null
++++ b/linehealth/linehealth_test.go
+@@ -0,0 +1,116 @@
++package linehealth
++
++import (
++	"testing"
++	"time"
++)
++
++type clock struct{ t time.Time }
++
++func (c *clock) now() time.Time      { return c.t }
++func (c *clock) add(d time.Duration) { c.t = c.t.Add(d) }
++func newTest() (*Monitor, *clock) {
++	c := &clock{t: time.Unix(1000000, 0)}
++	m := New()
++	m.now = c.now
++	return m, c
++}
++func send(h *Handle, c *clock, d time.Duration) {
++	for end := c.t.Add(d); c.t.Before(end); c.add(40 * time.Millisecond) {
++		h.Data()
++	}
++}
++
++func TestSteadyStreamIsGood(t *testing.T) {
++	m, c := newTest()
++	h := m.Connect("srt:a.stream")
++	send(h, c, 2*time.Minute)
++
++	r := m.Reports()["srt:a.stream"]
++	if !r.Connected || r.Level != LevelGood || r.Gaps != 0 || r.Drops != 0 || r.LastEventAgoSeconds != -1 {
++		t.Fatalf("unexpected %+v", r)
++	}
++	if r.ConnectedSeconds < 119 {
++		t.Fatalf("connected %v", r.ConnectedSeconds)
++	}
++}
++
++func TestGapsAndStall(t *testing.T) {
++	m, c := newTest()
++	h := m.Connect("rtmp:b.stream")
++	send(h, c, 10*time.Second)
++	c.add(1500 * time.Millisecond) // a gap
++	send(h, c, 10*time.Second)
++	c.add(800 * time.Millisecond) // too short to count
++	send(h, c, time.Second)
++
++	r := m.Reports()["rtmp:b.stream"]
++	if r.Gaps != 1 || r.LongestGapMs < 1500 || r.Level != LevelUnstable {
++		t.Fatalf("unexpected %+v", r)
++	}
++
++	c.add(6 * time.Second) // silent right now
++	r = m.Reports()["rtmp:b.stream"]
++	if r.StalledSeconds < 6 || r.Level != LevelBad {
++		t.Fatalf("stall not reported: %+v", r)
++	}
++}
++
++// The pattern of a flaky mobile line: data stops, the server times out after 10 s, the
++// encoder comes back. That is a drop plus a 10 s gap. A stop for good is no drop.
++func TestDropsAndStops(t *testing.T) {
++	m, c := newTest()
++	h := m.Connect("rtmp:c-backup.stream")
++	send(h, c, 45*time.Second)
++	c.add(10 * time.Second) // nothing arrives, then the read timeout
++	h.Close()
++	c.add(10 * time.Second) // OBS reconnects after 10 s
++	h = m.Connect("rtmp:c-backup.stream")
++	send(h, c, 30*time.Second)
++
++	r := m.Reports()["rtmp:c-backup.stream"]
++	if r.Drops != 1 || r.Gaps != 1 || r.LongestGapMs < 10000 || r.LongestGapMs > 10100 || r.Level != LevelBad {
++		t.Fatalf("unexpected %+v", r)
++	}
++
++	// stopped on purpose and not back: not a drop, and the stream is reported as disconnected
++	h.Close()
++	c.add(2 * time.Minute)
++	r = m.Reports()["rtmp:c-backup.stream"]
++	if r.Connected || r.Drops != 1 {
++		t.Fatalf("unexpected after stop %+v", r)
++	}
++}
++
++func TestWindowForgets(t *testing.T) {
++	m, c := newTest()
++	h := m.Connect("srt:d.stream")
++	send(h, c, time.Second)
++	c.add(3 * time.Second)
++	send(h, c, time.Second)
++	if r := m.Reports()["srt:d.stream"]; r.Gaps != 1 {
++		t.Fatalf("gap missing %+v", r)
++	}
++
++	send(h, c, Window+time.Second)
++	if r := m.Reports()["srt:d.stream"]; r.Gaps != 0 || r.Level != LevelGood {
++		t.Fatalf("old gap still reported %+v", r)
++	}
++
++	// a stream that is gone and has nothing in the window is dropped from the reports
++	h.Close()
++	c.add(ReconnectWithin + time.Second)
++	if _, ok := m.Reports()["srt:d.stream"]; ok {
++		t.Fatal("gone stream still reported")
++	}
++}
++
++func TestNilIsSafe(t *testing.T) {
++	var m *Monitor
++	h := m.Connect("x")
++	h.Data()
++	h.Close()
++	if len(m.Reports()) != 0 {
++		t.Fatal("nil monitor reported something")
++	}
++}
+diff --git a/rtmp/rtmp.go b/rtmp/rtmp.go
+index 83cd30f..555495e 100644
+--- a/rtmp/rtmp.go
++++ b/rtmp/rtmp.go
+@@ -10,14 +10,17 @@ import (
+ 	"io"
+ 	"net"
+ 	"net/url"
++	"path"
+ 	"path/filepath"
+ 	"strings"
+ 	"sync"
+ 	"time"
+ 
++	"github.com/datarhei/core/v16/linehealth"
+ 	"github.com/datarhei/core/v16/log"
+ 	"github.com/datarhei/core/v16/session"
+ 
++	"github.com/datarhei/joy4/av"
+ 	"github.com/datarhei/joy4/av/avutil"
+ 	"github.com/datarhei/joy4/av/pktque"
+ 	"github.com/datarhei/joy4/av/pubsub"
+@@ -216,6 +219,9 @@ type Config struct {
+ 	// Failover configures seamless switching to "<name>_fallback.stream" for players.
+ 	// Zero value = DefaultFailoverConfig().
+ 	Failover *FailoverConfig
++
++	// LineHealth records gaps and drops of the publishers (fork), keyed "rtmp:<name>".
++	LineHealth *linehealth.Monitor
+ }
+ 
+ // Server represents a RTMP server
+@@ -296,6 +302,7 @@ type server struct {
+ 
+ 	failover     FailoverConfig
+ 	failoverLock sync.RWMutex
++	lineHealth   *linehealth.Monitor
+ }
+ 
+ // New creates a new RTMP server according to the given config
+@@ -321,6 +328,8 @@ func New(config Config) (Server, error) {
+ 		s.collector = session.NewNullCollector()
+ 	}
+ 
++	s.lineHealth = config.LineHealth
++
+ 	s.failover = DefaultFailoverConfig()
+ 	if config.Failover != nil {
+ 		s.failover = *config.Failover
+@@ -631,8 +640,10 @@ func (s *server) handlePublish(conn *rtmp.Conn) {
+ 		s.log(log.Linfo, "PUBLISH", "STREAM", playPath, stream.Type().String(), client)
+ 	}
+ 
+-	// Ingest the data
+-	err := avutil.CopyPackets(ch.queue, conn)
++	// Ingest the data, noting gaps and drops for the line quality (fork)
++	health := s.lineHealth.Connect("rtmp:" + path.Base(playPath))
++	err := avutil.CopyPackets(&healthWriter{PacketWriter: ch.queue, health: health}, conn)
++	health.Close()
+ 	if err != nil {
+ 		if !errors.Is(err, io.EOF) {
+ 			s.log(log.Lerror, "PUBLISH", "ERROR", playPath, err.Error(), client)
+@@ -648,6 +659,17 @@ func (s *server) handlePublish(conn *rtmp.Conn) {
+ 	s.log(log.Linfo, "PUBLISH", "STOP", playPath, "", client)
+ }
+ 
++// healthWriter notes the arrival of every packet of a publisher (fork).
++type healthWriter struct {
++	av.PacketWriter
++	health *linehealth.Handle
++}
++
++func (w *healthWriter) WritePacket(pkt av.Packet) error {
++	w.health.Data()
++	return w.PacketWriter.WritePacket(pkt)
++}
++
+ // playFailover serves a player through the switching demuxer (see failover.go).
+ func (s *server) playFailover(conn *rtmp.Conn, playPath string, ch, fb *channel) {
+ 	client := conn.NetConn().RemoteAddr()
+diff --git a/srt/srt.go b/srt/srt.go
+index 18caebc..527fa24 100644
+--- a/srt/srt.go
++++ b/srt/srt.go
+@@ -11,9 +11,11 @@ import (
+ 	"sync"
+ 	"time"
+ 
++	"github.com/datarhei/core/v16/linehealth"
+ 	"github.com/datarhei/core/v16/log"
+ 	"github.com/datarhei/core/v16/session"
+ 	srt "github.com/datarhei/gosrt"
++	"github.com/datarhei/gosrt/packet"
+ )
+ 
+ // ErrServerClosed is returned by ListenAndServe if the server
+@@ -172,6 +174,9 @@ type Config struct {
+ 	Collector session.Collector
+ 
+ 	SRTLogTopics []string
++
++	// LineHealth records gaps and drops of the publishers (fork), keyed "srt:<resource>".
++	LineHealth *linehealth.Monitor
+ }
+ 
+ // Server represents a SRT server
+@@ -196,6 +201,8 @@ type server struct {
+ 
+ 	collector session.Collector
+ 
++	lineHealth *linehealth.Monitor
++
+ 	server srt.Server
+ 
+ 	// Map of publishing channels and a lock to serialize
+@@ -220,6 +227,7 @@ func New(config Config) (Server, error) {
+ 		passphrase: config.Passphrase,
+ 		collector:  config.Collector,
+ 		logger:     config.Logger,
++		lineHealth: config.LineHealth,
+ 	}
+ 
+ 	if s.collector == nil {
+@@ -607,7 +615,10 @@ func (s *server) handlePublish(conn srt.Conn) {
+ 
+ 	s.log("PUBLISH", "START", si.resource, "", client)
+ 
+-	ch.pubsub.Publish(conn)
++	// noting gaps and drops for the line quality (fork)
++	health := s.lineHealth.Connect("srt:" + si.resource)
++	ch.pubsub.Publish(&healthConn{Conn: conn, health: health})
++	health.Close()
+ 
+ 	s.lock.Lock()
+ 	delete(s.channels, si.resource)
+@@ -620,6 +631,20 @@ func (s *server) handlePublish(conn srt.Conn) {
+ 	conn.Close()
+ }
+ 
++// healthConn notes the arrival of every packet of a publisher (fork).
++type healthConn struct {
++	srt.Conn
++	health *linehealth.Handle
++}
++
++func (c *healthConn) ReadPacket() (packet.Packet, error) {
++	p, err := c.Conn.ReadPacket()
++	if err == nil {
++		c.health.Data()
++	}
++	return p, err
++}
++
+ func (s *server) handleSubscribe(conn srt.Conn) {
+ 	streamId := conn.StreamId()
+ 	client := conn.RemoteAddr()
+-- 
+2.43.0
+

@@ -1,0 +1,61 @@
+# Builds the Corvid image from the datarhei sources + patches/ and publishes it to the GitHub
+# Container Registry: ghcr.io/<owner>/corvid:<version> and :latest. No GPU is needed to build.
+name: Docker image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          docker system prune -af >/dev/null
+          df -h /
+
+      - name: Build (FFmpeg 9.0.2 + Corvid)
+        run: |
+          VERSION="$(sed -n 's/^# Corvid v//p' README.md | head -n1)"
+          IMAGE="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/corvid"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          TAG="$IMAGE:$VERSION" ./build.sh
+          docker tag "$IMAGE:$VERSION" "$IMAGE:latest"
+
+      - name: Check the image
+        run: |
+          docker run --rm --entrypoint ffmpeg "$IMAGE:$VERSION" -hide_banner -version | head -n1
+          docker run --rm --entrypoint ffmpeg "$IMAGE:$VERSION" -hide_banner -filters | grep -E 'scale_cuda|overlay_cuda'
+          docker run --rm --entrypoint ffmpeg "$IMAGE:$VERSION" -hide_banner -encoders | grep -E 'h264_nvenc|hevc_nvenc'
+          docker run --rm --entrypoint ffmpeg "$IMAGE:$VERSION" -hide_banner -buildconf | grep -q nonfree && { echo "nonfree build"; exit 1; } || true
+          docker image ls "$IMAGE"
+
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"

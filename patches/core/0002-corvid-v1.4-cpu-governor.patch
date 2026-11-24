@@ -1,0 +1,530 @@
+From be1483683d6c70fcd05966d46b4bf96ea2fa2055 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 18 Nov 2026 17:01:11 +0300
+Subject: [PATCH] Corvid v1.4: CPU frequency governor of the host
+
+GET/PUT /api/v3/fork/cpu read and set the governor of all CPUs through the
+host's /sys/devices/system/cpu mounted at /host/sys/cpu. The choice is
+stored and applied again at start; "" gives the host's original back.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ app/api/api.go          |  13 +++
+ cpufreq/cpufreq.go      | 242 ++++++++++++++++++++++++++++++++++++++++
+ cpufreq/cpufreq_test.go |  94 ++++++++++++++++
+ http/handler/api/cpu.go |  40 +++++++
+ http/roles.go           |   1 +
+ http/server.go          |  16 +++
+ 6 files changed, 406 insertions(+)
+ create mode 100644 cpufreq/cpufreq.go
+ create mode 100644 cpufreq/cpufreq_test.go
+ create mode 100644 http/handler/api/cpu.go
+
+diff --git a/app/api/api.go b/app/api/api.go
+index 12455d0..76eea3f 100644
+--- a/app/api/api.go
++++ b/app/api/api.go
+@@ -25,6 +25,7 @@ import (
+ 	"github.com/datarhei/core/v16/config"
+ 	configstore "github.com/datarhei/core/v16/config/store"
+ 	configvars "github.com/datarhei/core/v16/config/vars"
++	"github.com/datarhei/core/v16/cpufreq"
+ 	"github.com/datarhei/core/v16/ffmpeg"
+ 	"github.com/datarhei/core/v16/http"
+ 	"github.com/datarhei/core/v16/http/cache"
+@@ -73,6 +74,7 @@ type API interface {
+ }
+ 
+ type api struct {
++	cpu           *cpufreq.Manager
+ 	restream      restream.Restreamer
+ 	ffmpeg        ffmpeg.FFmpeg
+ 	diskfs        fs.Filesystem
+@@ -655,6 +657,16 @@ func (a *api) start() error {
+ 
+ 	a.restream = restream
+ 
++	// Fork: the host's CPU governor chosen in the panel, applied again at every start.
++	if a.cpu == nil {
++		a.cpu = cpufreq.New(filepath.Join(cfg.DB.Dir, "cpu.json"))
++	}
++	if governor, err := a.cpu.Apply(); err != nil {
++		a.log.logger.core.Warn().WithField("governor", governor).WithError(err).Log("CPU governor not applied")
++	} else if governor != "" {
++		a.log.logger.core.Info().WithField("governor", governor).Log("CPU governor applied")
++	}
++
+ 	var httpjwt jwt.JWT
+ 	var accounts *users.Store
+ 
+@@ -1092,6 +1104,7 @@ func (a *api) start() error {
+ 		Router:   router,
+ 		ReadOnly: cfg.API.ReadOnly,
+ 		Users:    accounts,
++		CPU:      a.cpu,
+ 	}
+ 
+ 	mainserverhandler, err := http.NewServer(serverConfig)
+diff --git a/cpufreq/cpufreq.go b/cpufreq/cpufreq.go
+new file mode 100644
+index 0000000..2cde0b1
+--- /dev/null
++++ b/cpufreq/cpufreq.go
+@@ -0,0 +1,242 @@
++// Package cpufreq reads and sets the CPU frequency governor of the host (fork).
++//
++// A streaming server is better off with the "performance" governor: with "powersave" the
++// cores idle at a low clock and every burst of work (a keyframe, a reconnect) first waits for
++// the clock to rise. The kernel exposes the governor in /sys/devices/system/cpu, which a
++// container can only read; the container gets the host's directory writable under
++// /host/sys/cpu for this (see docker-compose). The chosen governor is stored and applied again
++// when the core starts, because the host sets its own at boot. Choosing "" gives the host's
++// original governor back.
++package cpufreq
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sort"
++	"strconv"
++	"strings"
++	"sync"
++)
++
++// DefaultRoots are tried in order: the writable host directory, then the container's own
++// (read-only) view.
++var DefaultRoots = []string{"/host/sys/cpu", "/sys/devices/system/cpu"}
++
++var (
++	ErrUnavailable = errors.New("the CPU frequency settings cannot be changed from the container")
++	ErrGovernor    = errors.New("unknown governor")
++)
++
++// State is what the panel shows.
++type State struct {
++	Readable  bool     `json:"readable"`  // the governors can be read
++	Writable  bool     `json:"writable"`  // and changed
++	Driver    string   `json:"driver"`    // e.g. intel_pstate, acpi-cpufreq
++	Governors []string `json:"governors"` // available governors
++	Current   string   `json:"current"`   // governor of the CPUs ("mixed" if they differ)
++	Saved     string   `json:"saved"`     // governor chosen in the panel ("" = the host's)
++	Original  string   `json:"original"`  // the host's governor before the panel changed it
++	MHz       []int    `json:"mhz"`       // current clock per CPU
++	MaxMHz    int      `json:"max_mhz"`
++}
++
++type saved struct {
++	Governor string `json:"governor"`
++	Original string `json:"original"`
++}
++
++type Manager struct {
++	roots []string
++	file  string
++	lock  sync.Mutex
++}
++
++// New returns a manager that stores the choice in file. Without roots, DefaultRoots are used
++// (CORE_CPUFREQ_DIR, if set, is tried first).
++func New(file string, roots ...string) *Manager {
++	if len(roots) == 0 {
++		roots = DefaultRoots
++		if dir := os.Getenv("CORE_CPUFREQ_DIR"); dir != "" {
++			roots = append([]string{dir}, roots...)
++		}
++	}
++	return &Manager{roots: roots, file: file}
++}
++
++func read(path string) string {
++	data, err := os.ReadFile(path)
++	if err != nil {
++		return ""
++	}
++	return strings.TrimSpace(string(data))
++}
++
++// cpus returns the cpufreq directories of all CPUs below root.
++func cpus(root string) []string {
++	dirs, _ := filepath.Glob(filepath.Join(root, "cpu[0-9]*", "cpufreq"))
++	sort.Slice(dirs, func(i, j int) bool {
++		a, _ := strconv.Atoi(strings.TrimPrefix(filepath.Base(filepath.Dir(dirs[i])), "cpu"))
++		b, _ := strconv.Atoi(strings.TrimPrefix(filepath.Base(filepath.Dir(dirs[j])), "cpu"))
++		return a < b
++	})
++	return dirs
++}
++
++func writable(path string) bool {
++	f, err := os.OpenFile(path, os.O_WRONLY, 0)
++	if err != nil {
++		return false
++	}
++	f.Close()
++	return true
++}
++
++// root is the first directory with readable governors, and whether they can be written.
++func (m *Manager) root() (string, bool) {
++	first := ""
++	for _, r := range m.roots {
++		dirs := cpus(r)
++		if len(dirs) == 0 || read(filepath.Join(dirs[0], "scaling_governor")) == "" {
++			continue
++		}
++		if writable(filepath.Join(dirs[0], "scaling_governor")) {
++			return r, true
++		}
++		if first == "" {
++			first = r
++		}
++	}
++	return first, false
++}
++
++func (m *Manager) load() saved {
++	var s saved
++	if data, err := os.ReadFile(m.file); err == nil {
++		json.Unmarshal(data, &s)
++	}
++	return s
++}
++
++func (m *Manager) store(s saved) error {
++	if s.Governor == "" {
++		err := os.Remove(m.file)
++		if os.IsNotExist(err) {
++			return nil
++		}
++		return err
++	}
++	data, _ := json.Marshal(s)
++	tmp := m.file + ".tmp"
++	if err := os.WriteFile(tmp, data, 0o600); err != nil {
++		return err
++	}
++	return os.Rename(tmp, m.file)
++}
++
++// State reads the current settings.
++func (m *Manager) State() State {
++	m.lock.Lock()
++	defer m.lock.Unlock()
++	return m.state()
++}
++
++func (m *Manager) state() State {
++	s := m.load()
++	st := State{Saved: s.Governor, Original: s.Original, Governors: []string{}, MHz: []int{}}
++	root, w := m.root()
++	if root == "" {
++		return st
++	}
++	st.Readable, st.Writable = true, w
++	dirs := cpus(root)
++	st.Driver = read(filepath.Join(dirs[0], "scaling_driver"))
++	st.Governors = strings.Fields(read(filepath.Join(dirs[0], "scaling_available_governors")))
++	for i, d := range dirs {
++		g := read(filepath.Join(d, "scaling_governor"))
++		if i == 0 {
++			st.Current = g
++		} else if g != st.Current {
++			st.Current = "mixed"
++		}
++		khz, _ := strconv.Atoi(read(filepath.Join(d, "scaling_cur_freq")))
++		st.MHz = append(st.MHz, khz/1000)
++		if max, _ := strconv.Atoi(read(filepath.Join(d, "cpuinfo_max_freq"))); max/1000 > st.MaxMHz {
++			st.MaxMHz = max / 1000
++		}
++	}
++	return st
++}
++
++func (m *Manager) write(root, governor string) error {
++	for _, d := range cpus(root) {
++		if err := os.WriteFile(filepath.Join(d, "scaling_governor"), []byte(governor), 0); err != nil {
++			return fmt.Errorf("%s: %w", filepath.Base(filepath.Dir(d)), err)
++		}
++	}
++	return nil
++}
++
++// Set applies a governor to all CPUs and stores it; "" gives the host's original one back.
++func (m *Manager) Set(governor string) (State, error) {
++	m.lock.Lock()
++	defer m.lock.Unlock()
++
++	root, w := m.root()
++	if root == "" || !w {
++		return m.state(), ErrUnavailable
++	}
++	s := m.load()
++	st := m.state()
++
++	if governor == "" {
++		if s.Governor != "" && s.Original != "" && s.Original != "mixed" {
++			if err := m.write(root, s.Original); err != nil {
++				return m.state(), err
++			}
++		}
++		if err := m.store(saved{}); err != nil {
++			return m.state(), err
++		}
++		return m.state(), nil
++	}
++
++	known := false
++	for _, g := range st.Governors {
++		if g == governor {
++			known = true
++		}
++	}
++	if !known {
++		return st, ErrGovernor
++	}
++	if s.Governor == "" {
++		s.Original = st.Current
++	}
++	s.Governor = governor
++	if err := m.write(root, governor); err != nil {
++		return m.state(), err
++	}
++	if err := m.store(s); err != nil {
++		return m.state(), err
++	}
++	return m.state(), nil
++}
++
++// Apply sets the stored governor again (at start). Nothing is done without a stored choice.
++func (m *Manager) Apply() (string, error) {
++	m.lock.Lock()
++	defer m.lock.Unlock()
++
++	s := m.load()
++	if s.Governor == "" {
++		return "", nil
++	}
++	root, w := m.root()
++	if root == "" || !w {
++		return s.Governor, ErrUnavailable
++	}
++	return s.Governor, m.write(root, s.Governor)
++}
+diff --git a/cpufreq/cpufreq_test.go b/cpufreq/cpufreq_test.go
+new file mode 100644
+index 0000000..4a86b1f
+--- /dev/null
++++ b/cpufreq/cpufreq_test.go
+@@ -0,0 +1,94 @@
++package cpufreq
++
++import (
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++)
++
++func fakeSys(t *testing.T, n int, governor string) string {
++	root := t.TempDir()
++	for i := 0; i < n; i++ {
++		d := filepath.Join(root, "cpu"+string(rune('0'+i)), "cpufreq")
++		os.MkdirAll(d, 0o755)
++		os.WriteFile(filepath.Join(d, "scaling_governor"), []byte(governor+"\n"), 0o644)
++		os.WriteFile(filepath.Join(d, "scaling_available_governors"), []byte("performance powersave\n"), 0o644)
++		os.WriteFile(filepath.Join(d, "scaling_driver"), []byte("intel_pstate\n"), 0o644)
++		os.WriteFile(filepath.Join(d, "scaling_cur_freq"), []byte("800000\n"), 0o644)
++		os.WriteFile(filepath.Join(d, "cpuinfo_max_freq"), []byte("4000000\n"), 0o644)
++	}
++	os.MkdirAll(filepath.Join(root, "cpufreq"), 0o755) // not a CPU
++	return root
++}
++
++func governors(t *testing.T, root string) string {
++	out := []string{}
++	for _, d := range cpus(root) {
++		out = append(out, read(filepath.Join(d, "scaling_governor")))
++	}
++	return strings.Join(out, ",")
++}
++
++func TestSetApplyRestore(t *testing.T) {
++	sys := fakeSys(t, 4, "powersave")
++	file := filepath.Join(t.TempDir(), "cpu.json")
++	m := New(file, sys)
++
++	st := m.State()
++	if !st.Readable || !st.Writable || st.Current != "powersave" || st.Driver != "intel_pstate" || len(st.MHz) != 4 || st.MaxMHz != 4000 || st.Saved != "" {
++		t.Fatalf("state %+v", st)
++	}
++	if _, err := m.Set("ondemand"); err != ErrGovernor {
++		t.Fatalf("unknown governor: %v", err)
++	}
++	st, err := m.Set("performance")
++	if err != nil || st.Current != "performance" || st.Saved != "performance" || st.Original != "powersave" || governors(t, sys) != "performance,performance,performance,performance" {
++		t.Fatalf("set: %v %+v %s", err, st, governors(t, sys))
++	}
++
++	// the host resets it at boot; the core applies the choice again at start
++	for _, d := range cpus(sys) {
++		os.WriteFile(filepath.Join(d, "scaling_governor"), []byte("powersave"), 0o644)
++	}
++	m2 := New(file, sys)
++	if g, err := m2.Apply(); err != nil || g != "performance" || governors(t, sys) != "performance,performance,performance,performance" {
++		t.Fatalf("apply: %v %s %s", err, g, governors(t, sys))
++	}
++
++	// back to the host's own
++	st, err = m2.Set("")
++	if err != nil || st.Current != "powersave" || st.Saved != "" || governors(t, sys) != "powersave,powersave,powersave,powersave" {
++		t.Fatalf("restore: %v %+v", err, st)
++	}
++	if _, err := os.Stat(file); !os.IsNotExist(err) {
++		t.Fatal("the choice must be forgotten")
++	}
++	if g, err := New(file, sys).Apply(); g != "" || err != nil {
++		t.Fatalf("nothing to apply: %s %v", g, err)
++	}
++}
++
++func TestUnavailable(t *testing.T) {
++	m := New(filepath.Join(t.TempDir(), "cpu.json"), filepath.Join(t.TempDir(), "none"))
++	if st := m.State(); st.Readable || st.Writable {
++		t.Fatalf("%+v", st)
++	}
++	if _, err := m.Set("performance"); err != ErrUnavailable {
++		t.Fatal(err)
++	}
++
++	// readable but not writable (the container's own /sys)
++	sys := fakeSys(t, 2, "powersave")
++	for _, d := range cpus(sys) {
++		os.Chmod(filepath.Join(d, "scaling_governor"), 0o444)
++	}
++	if os.Geteuid() == 0 {
++		t.Log("root ignores file modes; the read-only case is checked on a read-only mount only")
++		return
++	}
++	st := New(filepath.Join(t.TempDir(), "cpu.json"), sys).State()
++	if !st.Readable || st.Writable {
++		t.Fatalf("%+v", st)
++	}
++}
+diff --git a/http/handler/api/cpu.go b/http/handler/api/cpu.go
+new file mode 100644
+index 0000000..355191f
+--- /dev/null
++++ b/http/handler/api/cpu.go
+@@ -0,0 +1,40 @@
++package api
++
++import (
++	"net/http"
++
++	"github.com/datarhei/core/v16/cpufreq"
++	"github.com/datarhei/core/v16/http/api"
++	"github.com/datarhei/core/v16/http/handler/util"
++
++	"github.com/labstack/echo/v4"
++)
++
++// CPUHandler reads and sets the host's CPU frequency governor (fork).
++type CPUHandler struct {
++	cpu *cpufreq.Manager
++}
++
++func NewCPU(m *cpufreq.Manager) *CPUHandler {
++	return &CPUHandler{cpu: m}
++}
++
++func (h *CPUHandler) Get(c echo.Context) error {
++	return c.JSON(http.StatusOK, h.cpu.State())
++}
++
++type cpuSet struct {
++	Governor string `json:"governor"`
++}
++
++func (h *CPUHandler) Set(c echo.Context) error {
++	var req cpuSet
++	if err := util.ShouldBindJSON(c, &req); err != nil {
++		return api.Err(http.StatusBadRequest, "", "Invalid JSON: %s", err.Error())
++	}
++	st, err := h.cpu.Set(req.Governor)
++	if err != nil {
++		return api.Err(http.StatusBadRequest, "", "%s", err.Error())
++	}
++	return c.JSON(http.StatusOK, st)
++}
+diff --git a/http/roles.go b/http/roles.go
+index 479bc12..c9a254d 100644
+--- a/http/roles.go
++++ b/http/roles.go
+@@ -27,6 +27,7 @@ var adminOnly = map[string]bool{
+ 	"DELETE /api/v3/fork/users/:name": true,
+ 	"POST /api/v3/fork/seal":          true,
+ 	"POST /api/v3/fork/unseal":        true,
++	"PUT /api/v3/fork/cpu":            true,
+ }
+ 
+ // viewerDenied are reading routes that change something nevertheless.
+diff --git a/http/server.go b/http/server.go
+index 30f3af1..9db3f3a 100644
+--- a/http/server.go
++++ b/http/server.go
+@@ -36,6 +36,7 @@ import (
+ 	"strings"
+ 
+ 	cfgstore "github.com/datarhei/core/v16/config/store"
++	"github.com/datarhei/core/v16/cpufreq"
+ 	"github.com/datarhei/core/v16/http/cache"
+ 	"github.com/datarhei/core/v16/http/errorhandler"
+ 	"github.com/datarhei/core/v16/http/fs"
+@@ -99,6 +100,8 @@ type Config struct {
+ 	// Users are the additional accounts and their roles (fork). Optional: without, every
+ 	// logged-in request is the administrator's.
+ 	Users *users.Store
++	// CPU sets the host's CPU frequency governor (fork); nil leaves it out.
++	CPU *cpufreq.Manager
+ }
+ 
+ type CorsConfig struct {
+@@ -136,6 +139,7 @@ type server struct {
+ 		widget    *api.WidgetHandler
+ 		resources *api.MetricsHandler
+ 		users     *api.UsersHandler
++		cpu       *api.CPUHandler
+ 	}
+ 
+ 	middleware struct {
+@@ -282,6 +286,10 @@ func NewServer(config Config) (Server, error) {
+ 		s.v3handler.users = api.NewUsers(config.Users)
+ 	}
+ 
++	if config.CPU != nil {
++		s.v3handler.cpu = api.NewCPU(config.CPU)
++	}
++
+ 	if config.SRT != nil {
+ 		s.v3handler.srt = api.NewSRT(
+ 			config.SRT,
+@@ -717,4 +725,12 @@ func (s *server) setRoutesV3(v3 *echo.Group) {
+ 		v3.POST("/fork/seal", s.v3handler.users.Seal)
+ 		v3.POST("/fork/unseal", s.v3handler.users.Unseal)
+ 	}
++
++	// v3 CPU frequency governor of the host (fork)
++	if s.v3handler.cpu != nil {
++		v3.GET("/fork/cpu", s.v3handler.cpu.Get)
++		if !s.readOnly {
++			v3.PUT("/fork/cpu", s.v3handler.cpu.Set)
++		}
++	}
+ }
+-- 
+2.43.0
+

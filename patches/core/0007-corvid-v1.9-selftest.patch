@@ -1,0 +1,1514 @@
+From 69c178d26873c1c023dc9a8d539254c5ab06e6e4 Mon Sep 17 00:00:00 2001
+From: Corvid <corvid@example.invalid>
+Date: Tue, 24 Nov 2026 07:53:04 +0300
+Subject: [PATCH] Fork: automatic check before broadcasts
+
+A schedule chosen in the panel (times, weekdays, time zone) runs a check of the
+graphics card encoder (short test encode), free disk space, stream keys and,
+per channel, source and backup senders, standby image and publication targets.
+GET/POST /api/v3/fork/selftest, PUT /api/v3/fork/selftest/schedule (admin).
+The reach check moves into its own package.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ app/api/api.go                            |  22 +
+ http/handler/api/reach.go                 | 111 +---
+ http/handler/api/selftest.go              |  40 ++
+ http/roles.go                             |  19 +-
+ http/server.go                            |  16 +
+ reach/reach.go                            | 113 ++++
+ {http/handler/api => reach}/reach_test.go |  14 +-
+ selftest/selftest.go                      | 711 ++++++++++++++++++++++
+ selftest/selftest_test.go                 | 169 +++++
+ selftest/system.go                        |  61 ++
+ 10 files changed, 1154 insertions(+), 122 deletions(-)
+ create mode 100644 http/handler/api/selftest.go
+ create mode 100644 reach/reach.go
+ rename {http/handler/api => reach}/reach_test.go (78%)
+ create mode 100644 selftest/selftest.go
+ create mode 100644 selftest/selftest_test.go
+ create mode 100644 selftest/system.go
+
+diff --git a/app/api/api.go b/app/api/api.go
+index 624529b..73d4317 100644
+--- a/app/api/api.go
++++ b/app/api/api.go
+@@ -10,6 +10,7 @@ import (
+ 	"crypto/tls"
+ 	"fmt"
+ 	"github.com/datarhei/core/v16/gpu"
++	"github.com/datarhei/core/v16/selftest"
+ 	"io"
+ 	golog "log"
+ 	"math"
+@@ -84,6 +85,7 @@ type api struct {
+ 	rtmpserver    rtmp.Server
+ 	failover      *rtmp.SettingsStore
+ 	lineHealth    *linehealth.Monitor
++	selftest      *selftest.Tester
+ 	srtserver     srt.Server
+ 	metrics       monitor.HistoryMonitor
+ 	prom          prometheus.Metrics
+@@ -1098,6 +1100,20 @@ func (a *api) start() error {
+ 		})
+ 	}
+ 
++	// Automatic check before broadcasts (fork): times chosen in the panel.
++	a.selftest = selftest.New(selftest.Config{
++		File:       filepath.Join(cfg.DB.Dir, "selftest.json"),
++		Restream:   a.restream,
++		FFmpeg:     cfg.FFmpeg.Binary,
++		DiskDir:    cfg.Storage.Disk.Dir,
++		GPU:        a.gpuMonitor,
++		LineHealth: a.lineHealth,
++		Keys: func() selftest.Keys {
++			return selftest.Keys{RTMP: cfg.RTMP.Enable, RTMPToken: cfg.RTMP.Token != "", SRT: cfg.SRT.Enable, SRTToken: cfg.SRT.Token != ""}
++		},
++	})
++	a.selftest.Start()
++
+ 	serverConfig := http.Config{
+ 		GPU:           a.gpuBalancer,
+ 		Logger:        a.log.logger.main,
+@@ -1123,6 +1139,7 @@ func (a *api) start() error {
+ 		CPU:          a.cpu,
+ 		Failover:     a.failover,
+ 		LineHealth:   a.lineHealth,
++		SelfTest:     a.selftest,
+ 		TicketSecret: cfg.API.Auth.JWT.Secret,
+ 	}
+ 
+@@ -1459,6 +1476,11 @@ func (a *api) stop() {
+ 		a.srtserver = nil
+ 	}
+ 
++	if a.selftest != nil {
++		a.selftest.Stop()
++		a.selftest = nil
++	}
++
+ 	// Stop the RTMP server
+ 	if a.rtmpserver != nil {
+ 		a.log.logger.rtmp.Info().Log("Stopping ...")
+diff --git a/http/handler/api/reach.go b/http/handler/api/reach.go
+index 5656d98..d827da2 100644
+--- a/http/handler/api/reach.go
++++ b/http/handler/api/reach.go
+@@ -2,16 +2,14 @@ package api
+ 
+ import (
+ 	"context"
+-	"net"
+ 	"net/http"
+-	"regexp"
+ 	"sort"
+-	"strings"
+ 	"sync"
+ 	"time"
+ 
+ 	"github.com/datarhei/core/v16/http/api"
+ 	"github.com/datarhei/core/v16/http/handler/util"
++	"github.com/datarhei/core/v16/reach"
+ 
+ 	"github.com/labstack/echo/v4"
+ )
+@@ -21,106 +19,7 @@ import (
+ // cannot make the server connect anywhere else.
+ 
+ // ReachResult is the outcome for one destination.
+-type ReachResult struct {
+-	Target   string `json:"target"`   // host:port, never the path (which holds the stream key)
+-	Protocol string `json:"protocol"` // rtmp, rtmps, srt, http, https, rtsp
+-	Resolved bool   `json:"resolved"` // the name has an address
+-	Reached  bool   `json:"reached"`  // a connection was accepted (always false for SRT, which is UDP)
+-	Checked  string `json:"checked"`  // "connect" or "name" (UDP: only the name can be checked)
+-	Millis   int64  `json:"ms"`
+-	Error    string `json:"error,omitempty"`
+-}
+-
+-type reachTarget struct {
+-	protocol string
+-	host     string
+-	port     string
+-}
+-
+-var reachURL = regexp.MustCompile(`(?i)\b(rtmps?|srt|https?|rtsp)://([^\s/|'"\]?#]+)`)
+-
+-var reachPorts = map[string]string{"rtmp": "1935", "rtmps": "443", "srt": "", "http": "80", "https": "443", "rtsp": "554"}
+-
+-// reachTargets finds the remote destinations in output addresses (plain or tee muxer form).
+-func reachTargets(addresses []string) []reachTarget {
+-	seen := map[string]bool{}
+-	targets := []reachTarget{}
+-
+-	for _, address := range addresses {
+-		for _, m := range reachURL.FindAllStringSubmatch(address, -1) {
+-			protocol := strings.ToLower(m[1])
+-			hostport := m[2]
+-
+-			// user:password@host
+-			if i := strings.LastIndex(hostport, "@"); i != -1 {
+-				hostport = hostport[i+1:]
+-			}
+-
+-			host, port, err := net.SplitHostPort(hostport)
+-			if err != nil {
+-				host, port = strings.Trim(hostport, "[]"), reachPorts[protocol]
+-			}
+-
+-			if host == "" || strings.ContainsAny(host, "{}") {
+-				continue // a placeholder of the core, i.e. this server itself
+-			}
+-
+-			if host == "localhost" {
+-				continue
+-			}
+-			if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+-				continue
+-			}
+-
+-			key := protocol + "|" + host + "|" + port
+-			if seen[key] {
+-				continue
+-			}
+-			seen[key] = true
+-
+-			targets = append(targets, reachTarget{protocol: protocol, host: host, port: port})
+-		}
+-	}
+-
+-	return targets
+-}
+-
+-func reachOne(ctx context.Context, t reachTarget) ReachResult {
+-	r := ReachResult{Protocol: t.protocol, Target: t.host, Checked: "connect"}
+-	if t.port != "" {
+-		r.Target = net.JoinHostPort(t.host, t.port)
+-	}
+-
+-	start := time.Now()
+-	defer func() { r.Millis = time.Since(start).Milliseconds() }()
+-
+-	addrs, err := net.DefaultResolver.LookupHost(ctx, t.host)
+-	if err != nil || len(addrs) == 0 {
+-		r.Error = "name not found"
+-		return r
+-	}
+-	r.Resolved = true
+-
+-	if t.protocol == "srt" || t.port == "" {
+-		// UDP has no connection to try without speaking the protocol.
+-		r.Checked = "name"
+-		return r
+-	}
+-
+-	d := net.Dialer{}
+-	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.host, t.port))
+-	if err != nil {
+-		r.Error = "no connection"
+-		if ctx.Err() != nil {
+-			r.Error = "timeout"
+-		}
+-		return r
+-	}
+-	conn.Close()
+-	r.Reached = true
+-
+-	return r
+-}
++type ReachResult = reach.Result
+ 
+ // Reach tries the destinations of a process
+ // @Summary Check whether the outputs of a process can be reached
+@@ -145,7 +44,7 @@ func (h *RestreamHandler) Reach(c echo.Context) error {
+ 		addresses = append(addresses, o.Address)
+ 	}
+ 
+-	targets := reachTargets(addresses)
++	targets := reach.Targets(addresses)
+ 	if len(targets) > 8 {
+ 		targets = targets[:8]
+ 	}
+@@ -158,9 +57,9 @@ func (h *RestreamHandler) Reach(c echo.Context) error {
+ 	wg := sync.WaitGroup{}
+ 	for i, t := range targets {
+ 		wg.Add(1)
+-		go func(i int, t reachTarget) {
++		go func(i int, t reach.Target) {
+ 			defer wg.Done()
+-			results[i] = reachOne(ctx, t)
++			results[i] = reach.Check(ctx, t)
+ 		}(i, t)
+ 	}
+ 	wg.Wait()
+diff --git a/http/handler/api/selftest.go b/http/handler/api/selftest.go
+new file mode 100644
+index 0000000..5773a91
+--- /dev/null
++++ b/http/handler/api/selftest.go
+@@ -0,0 +1,40 @@
++package api
++
++import (
++	"net/http"
++
++	"github.com/datarhei/core/v16/http/api"
++	"github.com/datarhei/core/v16/http/handler/util"
++	"github.com/datarhei/core/v16/selftest"
++
++	"github.com/labstack/echo/v4"
++)
++
++// SelfTestHandler runs the check before broadcasts and sets its schedule (fork).
++type SelfTestHandler struct {
++	tester *selftest.Tester
++}
++
++func NewSelfTest(tester *selftest.Tester) *SelfTestHandler {
++	return &SelfTestHandler{tester: tester}
++}
++
++func (h *SelfTestHandler) Get(c echo.Context) error {
++	return c.JSON(http.StatusOK, h.tester.Status())
++}
++
++func (h *SelfTestHandler) Run(c echo.Context) error {
++	return c.JSON(http.StatusOK, h.tester.Run("manual"))
++}
++
++func (h *SelfTestHandler) SetSchedule(c echo.Context) error {
++	var req selftest.Schedule
++	if err := util.ShouldBindJSON(c, &req); err != nil {
++		return api.Err(http.StatusBadRequest, "", "Invalid JSON: %s", err.Error())
++	}
++	st, err := h.tester.SetSchedule(req)
++	if err != nil {
++		return api.Err(http.StatusBadRequest, "", "%s", err.Error())
++	}
++	return c.JSON(http.StatusOK, st)
++}
+diff --git a/http/roles.go b/http/roles.go
+index 0422e30..2d7fa10 100644
+--- a/http/roles.go
++++ b/http/roles.go
+@@ -20,15 +20,16 @@ import (
+ 
+ // adminOnly are the routes (method + route pattern) only the administrator may use.
+ var adminOnly = map[string]bool{
+-	"PUT /api/v3/config":              true,
+-	"GET /api/v3/config/reload":       true,
+-	"GET /api/v3/fork/users":          true,
+-	"PUT /api/v3/fork/users/:name":    true,
+-	"DELETE /api/v3/fork/users/:name": true,
+-	"POST /api/v3/fork/seal":          true,
+-	"POST /api/v3/fork/unseal":        true,
+-	"PUT /api/v3/fork/cpu":            true,
+-	"PUT /api/v3/fork/failover":       true,
++	"PUT /api/v3/config":                 true,
++	"GET /api/v3/config/reload":          true,
++	"GET /api/v3/fork/users":             true,
++	"PUT /api/v3/fork/users/:name":       true,
++	"DELETE /api/v3/fork/users/:name":    true,
++	"POST /api/v3/fork/seal":             true,
++	"POST /api/v3/fork/unseal":           true,
++	"PUT /api/v3/fork/cpu":               true,
++	"PUT /api/v3/fork/failover":          true,
++	"PUT /api/v3/fork/selftest/schedule": true,
+ }
+ 
+ // viewerDenied are reading routes that change something nevertheless.
+diff --git a/http/server.go b/http/server.go
+index 912f97f..a53e930 100644
+--- a/http/server.go
++++ b/http/server.go
+@@ -53,6 +53,7 @@ import (
+ 	"github.com/datarhei/core/v16/prometheus"
+ 	"github.com/datarhei/core/v16/restream"
+ 	"github.com/datarhei/core/v16/rtmp"
++	"github.com/datarhei/core/v16/selftest"
+ 	"github.com/datarhei/core/v16/session"
+ 	"github.com/datarhei/core/v16/srt"
+ 	"github.com/datarhei/core/v16/users"
+@@ -111,6 +112,9 @@ type Config struct {
+ 
+ 	// Line quality of the RTMP/SRT publishers (fork).
+ 	LineHealth *linehealth.Monitor
++
++	// Automatic check before broadcasts (fork).
++	SelfTest *selftest.Tester
+ }
+ 
+ type CorsConfig struct {
+@@ -129,6 +133,7 @@ type server struct {
+ 	tickets  *tickets
+ 
+ 	lineHealth *linehealth.Monitor
++	selftest   *selftest.Tester
+ 
+ 	handler struct {
+ 		about      *api.AboutHandler
+@@ -297,6 +302,7 @@ func NewServer(config Config) (Server, error) {
+ 	s.restream = config.Restream
+ 	s.tickets = newTickets(config.TicketSecret)
+ 	s.lineHealth = config.LineHealth
++	s.selftest = config.SelfTest
+ 	if config.Users != nil {
+ 		s.v3handler.users = api.NewUsers(config.Users)
+ 	}
+@@ -774,6 +780,16 @@ func (s *server) setRoutesV3(v3 *echo.Group) {
+ 		})
+ 	}
+ 
++	// v3 automatic check before broadcasts (fork)
++	if s.selftest != nil {
++		h := api.NewSelfTest(s.selftest)
++		v3.GET("/fork/selftest", h.Get)
++		if !s.readOnly {
++			v3.POST("/fork/selftest", h.Run)
++			v3.PUT("/fork/selftest/schedule", h.SetSchedule)
++		}
++	}
++
+ 	// v3 RTMP failover: when viewers move to the backup and to the waiting picture (fork)
+ 	if s.v3handler.failover != nil {
+ 		v3.GET("/fork/failover", s.v3handler.failover.Get)
+diff --git a/reach/reach.go b/reach/reach.go
+new file mode 100644
+index 0000000..f8115d7
+--- /dev/null
++++ b/reach/reach.go
+@@ -0,0 +1,113 @@
++// Package reach (fork) checks whether this server can reach the places a process sends to:
++// the name is resolved and, for TCP protocols, a connection is opened and closed again.
++package reach
++
++import (
++	"context"
++	"net"
++	"regexp"
++	"strings"
++	"time"
++)
++
++// Result is the outcome for one destination.
++type Result struct {
++	Target   string `json:"target"`   // host:port, never the path (which holds the stream key)
++	Protocol string `json:"protocol"` // rtmp, rtmps, srt, http, https, rtsp
++	Resolved bool   `json:"resolved"` // the name has an address
++	Reached  bool   `json:"reached"`  // a connection was accepted (always false for SRT, which is UDP)
++	Checked  string `json:"checked"`  // "connect" or "name" (UDP: only the name can be checked)
++	Millis   int64  `json:"ms"`
++	Error    string `json:"error,omitempty"`
++}
++
++type Target struct {
++	Protocol string
++	Host     string
++	Port     string
++}
++
++var addressRE = regexp.MustCompile(`(?i)\b(rtmps?|srt|https?|rtsp)://([^\s/|'"\]?#]+)`)
++
++var defaultPorts = map[string]string{"rtmp": "1935", "rtmps": "443", "srt": "", "http": "80", "https": "443", "rtsp": "554"}
++
++// Targets finds the remote destinations in output addresses (plain or tee muxer form).
++func Targets(addresses []string) []Target {
++	seen := map[string]bool{}
++	targets := []Target{}
++
++	for _, address := range addresses {
++		for _, m := range addressRE.FindAllStringSubmatch(address, -1) {
++			protocol := strings.ToLower(m[1])
++			hostport := m[2]
++
++			// user:password@host
++			if i := strings.LastIndex(hostport, "@"); i != -1 {
++				hostport = hostport[i+1:]
++			}
++
++			host, port, err := net.SplitHostPort(hostport)
++			if err != nil {
++				host, port = strings.Trim(hostport, "[]"), defaultPorts[protocol]
++			}
++
++			if host == "" || strings.ContainsAny(host, "{}") {
++				continue // a placeholder of the core, i.e. this server itself
++			}
++
++			if host == "localhost" {
++				continue
++			}
++			if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
++				continue
++			}
++
++			key := protocol + "|" + host + "|" + port
++			if seen[key] {
++				continue
++			}
++			seen[key] = true
++
++			targets = append(targets, Target{Protocol: protocol, Host: host, Port: port})
++		}
++	}
++
++	return targets
++}
++
++func Check(ctx context.Context, t Target) Result {
++	r := Result{Protocol: t.Protocol, Target: t.Host, Checked: "connect"}
++	if t.Port != "" {
++		r.Target = net.JoinHostPort(t.Host, t.Port)
++	}
++
++	start := time.Now()
++	defer func() { r.Millis = time.Since(start).Milliseconds() }()
++
++	addrs, err := net.DefaultResolver.LookupHost(ctx, t.Host)
++	if err != nil || len(addrs) == 0 {
++		r.Error = "name not found"
++		return r
++	}
++	r.Resolved = true
++
++	if t.Protocol == "srt" || t.Port == "" {
++		// UDP has no connection to try without speaking the protocol.
++		r.Checked = "name"
++		return r
++	}
++
++	d := net.Dialer{}
++	conn, err := d.DialContext(ctx, "tcp", net.JoinHostPort(t.Host, t.Port))
++	if err != nil {
++		r.Error = "no connection"
++		if ctx.Err() != nil {
++			r.Error = "timeout"
++		}
++		return r
++	}
++	conn.Close()
++	r.Reached = true
++
++	return r
++}
+diff --git a/http/handler/api/reach_test.go b/reach/reach_test.go
+similarity index 78%
+rename from http/handler/api/reach_test.go
+rename to reach/reach_test.go
+index e123d20..1be14f1 100644
+--- a/http/handler/api/reach_test.go
++++ b/reach/reach_test.go
+@@ -1,4 +1,4 @@
+-package api
++package reach
+ 
+ import (
+ 	"context"
+@@ -10,7 +10,7 @@ import (
+ )
+ 
+ func TestReachTargets(t *testing.T) {
+-	targets := reachTargets([]string{
++	targets := Targets([]string{
+ 		"rtmp://a.rtmp.youtube.com/live2/secret-key",
+ 		"[f=flv]rtmps://live-api-s.facebook.com:443/rtmp/KEY|[f=flv]rtmp://b.rtmp.youtube.com/live2/secret-key?backup=1",
+ 		"srt://user:pw@relay.example.org:9000?streamid=abc",
+@@ -22,7 +22,7 @@ func TestReachTargets(t *testing.T) {
+ 		"-",
+ 	})
+ 
+-	require.Equal(t, []reachTarget{
++	require.Equal(t, []Target{
+ 		{"rtmp", "a.rtmp.youtube.com", "1935"},
+ 		{"rtmps", "live-api-s.facebook.com", "443"},
+ 		{"rtmp", "b.rtmp.youtube.com", "1935"},
+@@ -39,22 +39,22 @@ func TestReachOne(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+ 	defer cancel()
+ 
+-	r := reachOne(ctx, reachTarget{"rtmp", "127.0.0.1", port})
++	r := Check(ctx, Target{Protocol: "rtmp", Host: "127.0.0.1", Port: port})
+ 	require.True(t, r.Resolved)
+ 	require.True(t, r.Reached)
+ 	require.Equal(t, "127.0.0.1:"+port, r.Target)
+ 
+ 	l.Close()
+-	r = reachOne(ctx, reachTarget{"rtmp", "127.0.0.1", port})
++	r = Check(ctx, Target{Protocol: "rtmp", Host: "127.0.0.1", Port: port})
+ 	require.True(t, r.Resolved)
+ 	require.False(t, r.Reached)
+ 	require.Equal(t, "no connection", r.Error)
+ 
+-	r = reachOne(ctx, reachTarget{"rtmp", "does-not-exist.invalid", "1935"})
++	r = Check(ctx, Target{Protocol: "rtmp", Host: "does-not-exist.invalid", Port: "1935"})
+ 	require.False(t, r.Resolved)
+ 	require.Equal(t, "name not found", r.Error)
+ 
+-	r = reachOne(ctx, reachTarget{"srt", "127.0.0.1", "9000"})
++	r = Check(ctx, Target{Protocol: "srt", Host: "127.0.0.1", Port: "9000"})
+ 	require.True(t, r.Resolved)
+ 	require.False(t, r.Reached)
+ 	require.Equal(t, "name", r.Checked)
+diff --git a/selftest/selftest.go b/selftest/selftest.go
+new file mode 100644
+index 0000000..e48d0c6
+--- /dev/null
++++ b/selftest/selftest.go
+@@ -0,0 +1,711 @@
++// Package selftest (fork) checks, at times chosen in the panel or on request, whether the
++// server is ready for a broadcast: graphics card encoder, free space, stream keys, the
++// channels' backup and standby image, the publication targets and whether the senders are
++// connected. Nothing is started for viewers, nothing is changed: the encoder gets a short
++// test encode into nothing, publication targets a connection that is closed right away.
++package selftest
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++	_ "time/tzdata" // the panel sends the user's time zone; the container may not have the zone files
++
++	"github.com/datarhei/core/v16/gpu"
++	"github.com/datarhei/core/v16/linehealth"
++	"github.com/datarhei/core/v16/reach"
++	"github.com/datarhei/core/v16/restream"
++)
++
++// HistoryLength is how many runs are kept.
++const HistoryLength = 30
++
++// Schedule says when the test runs by itself.
++type Schedule struct {
++	Enabled  bool     `json:"enabled"`
++	Times    []string `json:"times"`    // "HH:MM", at most 6
++	Days     []int    `json:"days"`     // 1 = Monday .. 7 = Sunday; empty: every day
++	Timezone string   `json:"timezone"` // IANA name, e.g. Europe/Istanbul; empty: the server's
++}
++
++// Check is the outcome of one point of a run.
++type Check struct {
++	ID        string                 `json:"id"` // gpu, disk, keys, source, backup, slate, targets
++	ChannelID string                 `json:"channel_id,omitempty"`
++	Channel   string                 `json:"channel,omitempty"`
++	State     string                 `json:"state"` // ok, warn, fail, skip
++	Reason    string                 `json:"reason,omitempty"`
++	Detail    map[string]interface{} `json:"detail,omitempty"`
++}
++
++// Run is one test.
++type Run struct {
++	ID       int64     `json:"id"`
++	Trigger  string    `json:"trigger"` // schedule, manual
++	Started  time.Time `json:"started_at"`
++	Finished time.Time `json:"finished_at"`
++	State    string    `json:"state"` // worst state of the checks: ok, warn, fail
++	Checks   []Check   `json:"checks"`
++}
++
++// Status is what the API returns.
++type Status struct {
++	Schedule Schedule   `json:"schedule"`
++	Running  bool       `json:"running"`
++	Next     *time.Time `json:"next,omitempty"`
++	Last     *Run       `json:"last"`
++	History  []Run      `json:"history"` // newest first, without the checks
++}
++
++// Keys reports the stream key settings of the RTMP and the SRT server.
++type Keys struct {
++	RTMP      bool
++	RTMPToken bool
++	SRT       bool
++	SRTToken  bool
++}
++
++// Config holds what the test looks at.
++type Config struct {
++	File       string // where schedule and history are kept
++	Restream   restream.Restreamer
++	FFmpeg     string // the ffmpeg binary
++	DiskDir    string // root of the disk filesystem (recordings, standby images)
++	GPU        gpu.Monitor
++	LineHealth *linehealth.Monitor
++	Keys       func() Keys
++}
++
++type stored struct {
++	Schedule Schedule `json:"schedule"`
++	History  []Run    `json:"history"`
++}
++
++// Tester runs the checks and keeps the schedule and the history.
++type Tester struct {
++	cfg Config
++
++	lock     sync.Mutex
++	data     stored
++	running  chan struct{} // closed when the current run is done; nil if none runs
++	lastFire string
++
++	stop chan struct{}
++	done chan struct{}
++}
++
++// New loads the stored schedule and history. A missing or broken file starts empty.
++func New(cfg Config) *Tester {
++	t := &Tester{cfg: cfg, data: stored{Schedule: Schedule{Times: []string{}, Days: []int{}}, History: []Run{}}}
++	if b, err := os.ReadFile(cfg.File); err == nil {
++		var d stored
++		if json.Unmarshal(b, &d) == nil {
++			if s, err := cleanSchedule(d.Schedule); err == nil {
++				d.Schedule = s
++			} else {
++				d.Schedule = Schedule{}
++			}
++			t.data = d
++		}
++	}
++	return t
++}
++
++// Start the scheduler.
++func (t *Tester) Start() {
++	t.lock.Lock()
++	defer t.lock.Unlock()
++	if t.stop != nil {
++		return
++	}
++	t.stop = make(chan struct{})
++	t.done = make(chan struct{})
++	// a restart within the same minute must not run the test a second time
++	t.lastFire = fireKey(t.now())
++	go t.loop(t.stop, t.done)
++}
++
++// Stop the scheduler. A run that is going on finishes by itself.
++func (t *Tester) Stop() {
++	t.lock.Lock()
++	stop, done := t.stop, t.done
++	t.stop, t.done = nil, nil
++	t.lock.Unlock()
++	if stop != nil {
++		close(stop)
++		<-done
++	}
++}
++
++func (t *Tester) loop(stop, done chan struct{}) {
++	defer close(done)
++	ticker := time.NewTicker(10 * time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-stop:
++			return
++		case <-ticker.C:
++			t.tick()
++		}
++	}
++}
++
++func (t *Tester) now() time.Time {
++	return time.Now().In(location(t.data.Schedule.Timezone))
++}
++
++func fireKey(now time.Time) string {
++	return now.Format("2006-01-02 15:04")
++}
++
++func (t *Tester) tick() {
++	t.lock.Lock()
++	s := t.data.Schedule
++	now := t.now()
++	key := fireKey(now)
++	due := s.Enabled && key != t.lastFire && matches(s, now)
++	if due {
++		t.lastFire = key
++	}
++	t.lock.Unlock()
++	if due {
++		go t.Run("schedule")
++	}
++}
++
++func location(name string) *time.Location {
++	if name == "" {
++		return time.Local
++	}
++	if loc, err := time.LoadLocation(name); err == nil {
++		return loc
++	}
++	return time.Local
++}
++
++func weekday(now time.Time) int {
++	d := int(now.Weekday())
++	if d == 0 {
++		return 7
++	}
++	return d
++}
++
++func matches(s Schedule, now time.Time) bool {
++	if len(s.Days) != 0 {
++		found := false
++		for _, d := range s.Days {
++			if d == weekday(now) {
++				found = true
++			}
++		}
++		if !found {
++			return false
++		}
++	}
++	hm := now.Format("15:04")
++	for _, x := range s.Times {
++		if x == hm {
++			return true
++		}
++	}
++	return false
++}
++
++// next is the next time the schedule fires after now, nil if never.
++func next(s Schedule, now time.Time) *time.Time {
++	if !s.Enabled || len(s.Times) == 0 {
++		return nil
++	}
++	start := now.Truncate(time.Minute)
++	for day := 0; day < 8; day++ {
++		base := time.Date(start.Year(), start.Month(), start.Day()+day, 0, 0, 0, 0, start.Location())
++		for _, x := range s.Times {
++			var h, m int
++			fmt.Sscanf(x, "%d:%d", &h, &m)
++			at := time.Date(base.Year(), base.Month(), base.Day(), h, m, 0, 0, base.Location())
++			if at.After(start) && matches(s, at) {
++				return &at
++			}
++		}
++	}
++	return nil
++}
++
++var timeRE = regexp.MustCompile(`^([01][0-9]|2[0-3]):[0-5][0-9]$`)
++
++func cleanSchedule(s Schedule) (Schedule, error) {
++	out := Schedule{Enabled: s.Enabled, Times: []string{}, Days: []int{}, Timezone: strings.TrimSpace(s.Timezone)}
++	seen := map[string]bool{}
++	for _, x := range s.Times {
++		x = strings.TrimSpace(x)
++		if len(x) == 4 && x[1] == ':' {
++			x = "0" + x
++		}
++		if !timeRE.MatchString(x) {
++			return out, fmt.Errorf("invalid time %q, expected HH:MM", x)
++		}
++		if !seen[x] {
++			seen[x] = true
++			out.Times = append(out.Times, x)
++		}
++	}
++	if len(out.Times) > 6 {
++		return out, fmt.Errorf("at most 6 times")
++	}
++	sort.Strings(out.Times)
++	days := map[int]bool{}
++	for _, d := range s.Days {
++		if d < 1 || d > 7 {
++			return out, fmt.Errorf("invalid day %d, expected 1 (Monday) to 7 (Sunday)", d)
++		}
++		days[d] = true
++	}
++	for d := 1; d <= 7; d++ {
++		if days[d] {
++			out.Days = append(out.Days, d)
++		}
++	}
++	if len(out.Days) == 7 {
++		out.Days = []int{}
++	}
++	if out.Timezone != "" {
++		if _, err := time.LoadLocation(out.Timezone); err != nil {
++			return out, fmt.Errorf("unknown time zone %q", out.Timezone)
++		}
++	}
++	if out.Enabled && len(out.Times) == 0 {
++		return out, fmt.Errorf("choose at least one time")
++	}
++	return out, nil
++}
++
++// SetSchedule stores a new schedule.
++func (t *Tester) SetSchedule(s Schedule) (Status, error) {
++	s, err := cleanSchedule(s)
++	if err != nil {
++		return t.Status(), err
++	}
++	t.lock.Lock()
++	old := t.data.Schedule
++	t.data.Schedule = s
++	err = t.save()
++	if err != nil {
++		t.data.Schedule = old
++	} else {
++		// saving a time that is the current minute must not run it right away
++		t.lastFire = fireKey(time.Now().In(location(s.Timezone)))
++	}
++	t.lock.Unlock()
++	return t.Status(), err
++}
++
++// must hold the lock
++func (t *Tester) save() error {
++	if t.cfg.File == "" {
++		return nil
++	}
++	b, err := json.MarshalIndent(t.data, "", "\t")
++	if err != nil {
++		return err
++	}
++	tmp := t.cfg.File + ".tmp"
++	if err := os.WriteFile(tmp, b, 0o600); err != nil {
++		return err
++	}
++	return os.Rename(tmp, t.cfg.File)
++}
++
++// Status returns schedule, last run and the short history.
++func (t *Tester) Status() Status {
++	t.lock.Lock()
++	defer t.lock.Unlock()
++	st := Status{Schedule: t.data.Schedule, Running: t.running != nil, History: []Run{}}
++	st.Next = next(t.data.Schedule, t.now())
++	for i, r := range t.data.History {
++		if i == 0 {
++			last := r
++			st.Last = &last
++		}
++		r.Checks = nil
++		st.History = append(st.History, r)
++	}
++	return st
++}
++
++// Run runs the test now and returns it. If a run is going on, it waits for that one and
++// returns it instead of starting a second one.
++func (t *Tester) Run(trigger string) Run {
++	t.lock.Lock()
++	if t.running != nil {
++		wait := t.running
++		t.lock.Unlock()
++		<-wait
++		t.lock.Lock()
++		defer t.lock.Unlock()
++		if len(t.data.History) != 0 {
++			return t.data.History[0]
++		}
++		return Run{}
++	}
++	t.running = make(chan struct{})
++	id := int64(1)
++	if len(t.data.History) != 0 {
++		id = t.data.History[0].ID + 1
++	}
++	t.lock.Unlock()
++
++	run := Run{ID: id, Trigger: trigger, Started: time.Now().UTC()}
++	run.Checks = t.checks()
++	run.Finished = time.Now().UTC()
++	run.State = "ok"
++	for _, c := range run.Checks {
++		if c.State == "fail" {
++			run.State = "fail"
++		} else if c.State == "warn" && run.State == "ok" {
++			run.State = "warn"
++		}
++	}
++
++	t.lock.Lock()
++	t.data.History = append([]Run{run}, t.data.History...)
++	if len(t.data.History) > HistoryLength {
++		t.data.History = t.data.History[:HistoryLength]
++	}
++	t.save()
++	close(t.running)
++	t.running = nil
++	t.lock.Unlock()
++
++	return run
++}
++
++// ---- the checks ----
++
++type channel struct {
++	id       string // process ID
++	ref      string
++	name     string
++	input    string
++	backup   string
++	slate    string
++	fallback bool
++}
++
++var ingestRE = regexp.MustCompile(`^restreamer-ui:ingest:[0-9a-fA-F-]{36}$`)
++
++type uiMeta struct {
++	Meta struct {
++		Name string `json:"name"`
++	} `json:"meta"`
++	Control struct {
++		Fallback struct {
++			Enable bool   `json:"enable"`
++			Type   string `json:"type"`
++			URL    string `json:"url"`
++			Image  string `json:"image"`
++		} `json:"fallback"`
++	} `json:"control"`
++	Name string `json:"name"` // publications
++}
++
++func readMeta(r restream.Restreamer, id string) uiMeta {
++	m := uiMeta{}
++	data, err := r.GetProcessMetadata(id, "restreamer-ui")
++	if err != nil || data == nil {
++		return m
++	}
++	b, err := json.Marshal(data)
++	if err == nil {
++		json.Unmarshal(b, &m)
++	}
++	return m
++}
++
++func (t *Tester) channels() []channel {
++	r := t.cfg.Restream
++	if r == nil {
++		return nil
++	}
++	list := []channel{}
++	for _, id := range r.GetProcessIDs("", "") {
++		if !ingestRE.MatchString(id) {
++			continue
++		}
++		p, err := r.GetProcess(id)
++		if err != nil {
++			continue
++		}
++		m := readMeta(r, id)
++		c := channel{id: id, ref: p.Reference, name: m.Meta.Name}
++		if p.Config != nil && len(p.Config.Input) != 0 {
++			c.input = p.Config.Input[0].Address
++		}
++		fb := m.Control.Fallback
++		c.fallback = fb.Enable
++		if fb.Enable && fb.Type == "stream" {
++			c.backup = strings.TrimSpace(fb.URL)
++		}
++		if fb.Enable {
++			c.slate = fb.Image
++		}
++		list = append(list, c)
++	}
++	sort.Slice(list, func(a, b int) bool { return list[a].name < list[b].name })
++	return list
++}
++
++func (t *Tester) checks() []Check {
++	out := []Check{}
++	out = append(out, t.checkGPU())
++	out = append(out, t.checkDisk())
++	out = append(out, t.checkKeys())
++
++	channels := t.channels()
++	var reports map[string]linehealth.Report
++	if t.cfg.LineHealth != nil {
++		reports = t.cfg.LineHealth.Reports()
++	}
++	for _, c := range channels {
++		out = append(out, t.checkFeed("source", c, c.input, reports))
++		if c.backup == "" {
++			out = append(out, Check{ID: "backup", ChannelID: c.ref, Channel: c.name, State: "warn", Reason: "none"})
++		} else {
++			out = append(out, t.checkFeed("backup", c, c.backup, reports))
++		}
++		out = append(out, t.checkSlate(c))
++		out = append(out, t.checkTargets(c))
++	}
++	if len(channels) == 0 {
++		out = append(out, Check{ID: "source", State: "warn", Reason: "nochannel"})
++	}
++	return out
++}
++
++func (t *Tester) checkGPU() Check {
++	c := Check{ID: "gpu", Detail: map[string]interface{}{}}
++	var devices []gpu.Device
++	if t.cfg.GPU != nil {
++		devices = t.cfg.GPU.Devices()
++	}
++	if len(devices) == 0 {
++		c.State, c.Reason = "skip", "none"
++		return c
++	}
++	d := devices[0]
++	c.Detail["name"] = d.Name
++	c.Detail["temperature"] = d.TemperatureC
++	sessions := 0
++	for _, x := range devices {
++		sessions += x.EncoderSession
++	}
++	if sessions > 0 {
++		// it is encoding right now, which is the best proof; no extra session on top
++		c.State, c.Reason = "ok", "busy"
++		c.Detail["sessions"] = sessions
++		c.Detail["load"] = d.UtilEncoder
++		if d.UtilEncoder >= 90 {
++			c.State = "warn"
++		}
++		return c
++	}
++	ms, err := encodeTest(t.cfg.FFmpeg)
++	c.Detail["ms"] = ms
++	if err != nil {
++		c.State, c.Reason = "fail", "encode"
++		c.Detail["error"] = err.Error()
++		return c
++	}
++	c.State, c.Reason = "ok", "encoded"
++	if d.TemperatureC >= 85 {
++		c.State, c.Reason = "warn", "hot"
++	}
++	return c
++}
++
++func (t *Tester) checkDisk() Check {
++	c := Check{ID: "disk", Detail: map[string]interface{}{}}
++	free, total, err := diskSpace(t.cfg.DiskDir)
++	if err != nil || total == 0 {
++		c.State, c.Reason = "skip", "unknown"
++		return c
++	}
++	c.Detail["free"] = free
++	c.Detail["total"] = total
++	const gb = 1024 * 1024 * 1024
++	switch {
++	case free < 1*gb:
++		c.State = "fail"
++	case free < 5*gb:
++		c.State = "warn"
++	default:
++		c.State = "ok"
++	}
++	return c
++}
++
++func (t *Tester) checkKeys() Check {
++	c := Check{ID: "keys", Detail: map[string]interface{}{}}
++	if t.cfg.Keys == nil {
++		c.State, c.Reason = "skip", "unknown"
++		return c
++	}
++	k := t.cfg.Keys()
++	missing := []string{}
++	if k.RTMP && !k.RTMPToken {
++		missing = append(missing, "rtmp")
++	}
++	if k.SRT && !k.SRTToken {
++		missing = append(missing, "srt")
++	}
++	if !k.RTMP && !k.SRT {
++		c.State, c.Reason = "skip", "noserver"
++		return c
++	}
++	if len(missing) != 0 {
++		c.State, c.Reason = "warn", "nokey"
++		c.Detail["servers"] = missing
++		return c
++	}
++	c.State = "ok"
++	return c
++}
++
++var placeholderRE = regexp.MustCompile(`^\{(rtmp|srt),name=([^,}]+)`)
++
++// healthKey is the line health key of an address of this server's RTMP or SRT server.
++func healthKey(address string) string {
++	m := placeholderRE.FindStringSubmatch(address)
++	if m == nil {
++		return ""
++	}
++	return m[1] + ":" + m[2]
++}
++
++func (t *Tester) checkFeed(id string, ch channel, address string, reports map[string]linehealth.Report) Check {
++	c := Check{ID: id, ChannelID: ch.ref, Channel: ch.name, Detail: map[string]interface{}{}}
++	if address == "" {
++		c.State, c.Reason = "fail", "nosource"
++		return c
++	}
++	key := healthKey(address)
++	if key == "" {
++		// pulled from elsewhere (e.g. a camera): its state is in the process
++		state, err := t.cfg.Restream.GetProcessState(ch.id)
++		if id == "source" && err == nil && state.State == "running" && state.Progress.Input != nil {
++			c.State, c.Reason = "ok", "pulled"
++			return c
++		}
++		c.State, c.Reason = "skip", "external"
++		return c
++	}
++	c.Detail["protocol"] = strings.SplitN(key, ":", 2)[0]
++	r, ok := reports[key]
++	if !ok || !r.Connected {
++		// before the broadcast nobody may be sending yet: that is not an error
++		c.State, c.Reason = "skip", "idle"
++		if ok {
++			c.Detail["drops"] = r.Drops
++		}
++		return c
++	}
++	c.Detail["level"] = r.Level
++	c.Detail["drops"] = r.Drops
++	c.Detail["gaps"] = r.Gaps
++	c.Detail["longest_gap_ms"] = r.LongestGapMs
++	switch r.Level {
++	case "bad":
++		c.State, c.Reason = "warn", "weak"
++	case "unstable":
++		c.State, c.Reason = "warn", "unstable"
++	default:
++		c.State, c.Reason = "ok", "sending"
++	}
++	return c
++}
++
++func (t *Tester) checkSlate(ch channel) Check {
++	c := Check{ID: "slate", ChannelID: ch.ref, Channel: ch.name}
++	if ch.slate == "" {
++		c.State, c.Reason = "warn", "none"
++		return c
++	}
++	if t.cfg.DiskDir == "" {
++		c.State, c.Reason = "skip", "unknown"
++		return c
++	}
++	p := filepath.Join(t.cfg.DiskDir, filepath.Clean("/"+ch.slate))
++	if st, err := os.Stat(p); err != nil || st.IsDir() || st.Size() == 0 {
++		c.State, c.Reason = "fail", "missing"
++		return c
++	}
++	c.State = "ok"
++	return c
++}
++
++func (t *Tester) checkTargets(ch channel) Check {
++	c := Check{ID: "targets", ChannelID: ch.ref, Channel: ch.name, Detail: map[string]interface{}{}}
++	r := t.cfg.Restream
++	type target struct {
++		Name  string         `json:"name"`
++		Hosts []reach.Result `json:"hosts"`
++	}
++	targets := []target{}
++	for _, id := range r.GetProcessIDs("", "") {
++		if !strings.HasPrefix(id, "restreamer-ui:egress:") {
++			continue
++		}
++		p, err := r.GetProcess(id)
++		if err != nil || p.Reference != ch.ref || p.Config == nil {
++			continue
++		}
++		addresses := []string{}
++		for _, o := range p.Config.Output {
++			addresses = append(addresses, o.Address)
++		}
++		list := reach.Targets(addresses)
++		if len(list) > 8 {
++			list = list[:8]
++		}
++		if len(list) == 0 {
++			continue // to this server only, e.g. the player
++		}
++		results := make([]reach.Result, len(list))
++		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		wg := sync.WaitGroup{}
++		for i, x := range list {
++			wg.Add(1)
++			go func(i int, x reach.Target) {
++				defer wg.Done()
++				results[i] = reach.Check(ctx, x)
++			}(i, x)
++		}
++		wg.Wait()
++		cancel()
++		name := readMeta(r, id).Name
++		targets = append(targets, target{Name: name, Hosts: results})
++	}
++	if len(targets) == 0 {
++		c.State, c.Reason = "skip", "none"
++		return c
++	}
++	c.Detail["targets"] = targets
++	c.State = "ok"
++	for _, x := range targets {
++		for _, h := range x.Hosts {
++			ok := h.Reached || (h.Checked == "name" && h.Resolved)
++			if !ok {
++				c.State, c.Reason = "fail", "unreachable"
++			}
++		}
++	}
++	return c
++}
+diff --git a/selftest/selftest_test.go b/selftest/selftest_test.go
+new file mode 100644
+index 0000000..c740600
+--- /dev/null
++++ b/selftest/selftest_test.go
+@@ -0,0 +1,169 @@
++package selftest
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/datarhei/core/v16/gpu"
++	"github.com/stretchr/testify/require"
++)
++
++func TestCleanSchedule(t *testing.T) {
++	s, err := cleanSchedule(Schedule{Enabled: true, Times: []string{"9:05", "08:30", "08:30"}, Days: []int{5, 1, 1}, Timezone: "Europe/Istanbul"})
++	require.NoError(t, err)
++	require.Equal(t, []string{"08:30", "09:05"}, s.Times)
++	require.Equal(t, []int{1, 5}, s.Days)
++
++	s, err = cleanSchedule(Schedule{Times: []string{"10:00"}, Days: []int{1, 2, 3, 4, 5, 6, 7}})
++	require.NoError(t, err)
++	require.Equal(t, []int{}, s.Days, "all days is the same as none")
++
++	for _, bad := range []Schedule{
++		{Times: []string{"24:00"}},
++		{Times: []string{"8.30"}},
++		{Days: []int{0}},
++		{Timezone: "Mars/Olympus"},
++		{Enabled: true},
++		{Times: []string{"01:00", "02:00", "03:00", "04:00", "05:00", "06:00", "07:00"}},
++	} {
++		_, err := cleanSchedule(bad)
++		require.Error(t, err, "%+v", bad)
++	}
++}
++
++func TestNextAndMatches(t *testing.T) {
++	loc, _ := time.LoadLocation("Europe/Istanbul")
++	// Tuesday, 24 Nov 2026, 08:00
++	now := time.Date(2026, 11, 24, 8, 0, 0, 0, loc)
++	s := Schedule{Enabled: true, Times: []string{"08:30", "18:00"}, Days: []int{1, 3}}
++
++	n := next(s, now)
++	require.NotNil(t, n)
++	require.Equal(t, time.Date(2026, 11, 25, 8, 30, 0, 0, loc), *n, "Tuesday is not chosen: Wednesday")
++
++	s.Days = nil
++	n = next(s, now)
++	require.Equal(t, time.Date(2026, 11, 24, 8, 30, 0, 0, loc), *n)
++	require.True(t, matches(s, *n))
++	require.False(t, matches(s, n.Add(time.Minute)))
++
++	n = next(s, time.Date(2026, 11, 24, 8, 30, 20, 0, loc))
++	require.Equal(t, time.Date(2026, 11, 24, 18, 0, 0, 0, loc), *n, "not the minute that is going on")
++
++	s.Enabled = false
++	require.Nil(t, next(s, now))
++}
++
++func TestRunAndHistory(t *testing.T) {
++	dir := t.TempDir()
++	file := filepath.Join(dir, "selftest.json")
++	disk := filepath.Join(dir, "disk")
++	require.NoError(t, os.MkdirAll(disk, 0o755))
++
++	tt := New(Config{File: file, DiskDir: disk, Keys: func() Keys { return Keys{RTMP: true, SRT: true, SRTToken: true} }})
++	run := tt.Run("manual")
++	require.Equal(t, int64(1), run.ID)
++
++	byID := map[string]Check{}
++	for _, c := range run.Checks {
++		byID[c.ID] = c
++	}
++	require.Equal(t, "skip", byID["gpu"].State)
++	require.NotEqual(t, "", byID["disk"].State)
++	require.Equal(t, "warn", byID["keys"].State)
++	require.Equal(t, []string{"rtmp"}, byID["keys"].Detail["servers"])
++	require.Equal(t, "nochannel", byID["source"].Reason)
++	require.Equal(t, "warn", run.State)
++
++	for i := 0; i < HistoryLength+3; i++ {
++		tt.Run("manual")
++	}
++	st := tt.Status()
++	require.Len(t, st.History, HistoryLength)
++	require.Equal(t, int64(HistoryLength+4), st.Last.ID)
++	require.Nil(t, st.History[0].Checks, "the history is short")
++	require.NotEmpty(t, st.Last.Checks)
++
++	_, err := tt.SetSchedule(Schedule{Enabled: true, Times: []string{"07:15"}, Timezone: "Europe/Istanbul"})
++	require.NoError(t, err)
++
++	// kept across restarts
++	again := New(Config{File: file})
++	st = again.Status()
++	require.Equal(t, []string{"07:15"}, st.Schedule.Times)
++	require.Len(t, st.History, HistoryLength)
++	require.NotNil(t, st.Next)
++}
++
++func TestScheduleFiresOncePerMinute(t *testing.T) {
++	tt := New(Config{})
++	now := time.Now()
++	tt.data.Schedule = Schedule{Enabled: true, Times: []string{now.Format("15:04")}}
++	tt.tick()
++	tt.tick()
++	require.Eventually(t, func() bool { return len(tt.Status().History) == 1 && !tt.Status().Running }, 5*time.Second, 50*time.Millisecond)
++	time.Sleep(100 * time.Millisecond)
++	require.Len(t, tt.Status().History, 1)
++
++	// saving the schedule in the minute it names does not run it
++	tt2 := New(Config{})
++	_, err := tt2.SetSchedule(Schedule{Enabled: true, Times: []string{time.Now().Format("15:04")}})
++	require.NoError(t, err)
++	tt2.tick()
++	time.Sleep(100 * time.Millisecond)
++	require.Len(t, tt2.Status().History, 0)
++}
++
++func TestSlate(t *testing.T) {
++	dir := t.TempDir()
++	require.NoError(t, os.MkdirAll(filepath.Join(dir, "channels", "x"), 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "channels", "x", "fallback.jpg"), []byte("jpg"), 0o644))
++	tt := New(Config{DiskDir: dir})
++
++	require.Equal(t, "ok", tt.checkSlate(channel{slate: "/channels/x/fallback.jpg"}).State)
++	require.Equal(t, "fail", tt.checkSlate(channel{slate: "/channels/x/gone.jpg"}).State)
++	require.Equal(t, "fail", tt.checkSlate(channel{slate: "/../../etc/passwd"}).State, "stays in the disk")
++	require.Equal(t, "warn", tt.checkSlate(channel{}).State)
++}
++
++func TestHealthKey(t *testing.T) {
++	require.Equal(t, "rtmp:abc.stream", healthKey("{rtmp,name=abc.stream}"))
++	require.Equal(t, "srt:abc", healthKey("{srt,name=abc,mode=request}"))
++	require.Equal(t, "", healthKey("rtsp://camera/x"))
++}
++
++type fakeGPU struct{ d []gpu.Device }
++
++func (f fakeGPU) Devices() []gpu.Device { return f.d }
++func (f fakeGPU) Close()                {}
++
++func TestGPU(t *testing.T) {
++	dir := t.TempDir()
++	good := filepath.Join(dir, "good")
++	bad := filepath.Join(dir, "bad")
++	require.NoError(t, os.WriteFile(good, []byte("#!/bin/sh\nexit 0\n"), 0o755))
++	require.NoError(t, os.WriteFile(bad, []byte("#!/bin/sh\necho 'OpenEncodeSessionEx failed: out of memory' >&2\nexit 1\n"), 0o755))
++
++	dev := gpu.Device{Name: "GTX 1050", TemperatureC: 40}
++	c := (&Tester{cfg: Config{FFmpeg: good, GPU: fakeGPU{[]gpu.Device{dev}}}}).checkGPU()
++	require.Equal(t, "ok", c.State)
++	require.Equal(t, "encoded", c.Reason)
++
++	c = (&Tester{cfg: Config{FFmpeg: bad, GPU: fakeGPU{[]gpu.Device{dev}}}}).checkGPU()
++	require.Equal(t, "fail", c.State)
++	require.Contains(t, c.Detail["error"], "OpenEncodeSessionEx")
++
++	dev.EncoderSession = 2
++	c = (&Tester{cfg: Config{FFmpeg: bad, GPU: fakeGPU{[]gpu.Device{dev}}}}).checkGPU()
++	require.Equal(t, "ok", c.State, "busy encoding: no extra session")
++	require.Equal(t, "busy", c.Reason)
++}
++
++func TestEmptyStatus(t *testing.T) {
++	st := New(Config{File: filepath.Join(t.TempDir(), "none.json")}).Status()
++	require.NotNil(t, st.Schedule.Times)
++	require.NotNil(t, st.Schedule.Days)
++	require.Nil(t, st.Last)
++}
+diff --git a/selftest/system.go b/selftest/system.go
+new file mode 100644
+index 0000000..cbf4850
+--- /dev/null
++++ b/selftest/system.go
+@@ -0,0 +1,61 @@
++package selftest
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"os/exec"
++	"strings"
++	"syscall"
++	"time"
++)
++
++// encodeTest makes the graphics card encode two seconds of a test picture into nothing.
++func encodeTest(binary string) (int64, error) {
++	if binary == "" {
++		binary = "ffmpeg"
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++	defer cancel()
++
++	start := time.Now()
++	cmd := exec.CommandContext(ctx, binary, "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
++		"-f", "lavfi", "-t", "2", "-i", "testsrc2=size=1280x720:rate=30",
++		"-c:v", "h264_nvenc", "-preset", "p4", "-b:v", "4M",
++		"-f", "null", "-")
++	var stderr bytes.Buffer
++	cmd.Stderr = &stderr
++	err := cmd.Run()
++	ms := time.Since(start).Milliseconds()
++	if err != nil {
++		if ctx.Err() != nil {
++			return ms, errors.New("timeout after 30 s")
++		}
++		return ms, errors.New(lastLine(stderr.String(), err.Error()))
++	}
++	return ms, nil
++}
++
++func lastLine(s, fallback string) string {
++	lines := strings.Split(strings.TrimSpace(s), "\n")
++	for i := len(lines) - 1; i >= 0; i-- {
++		if l := strings.TrimSpace(lines[i]); l != "" {
++			if len(l) > 200 {
++				l = l[:200]
++			}
++			return l
++		}
++	}
++	return fallback
++}
++
++func diskSpace(dir string) (free, total uint64, err error) {
++	if dir == "" {
++		return 0, 0, errors.New("no directory")
++	}
++	var st syscall.Statfs_t
++	if err := syscall.Statfs(dir, &st); err != nil {
++		return 0, 0, err
++	}
++	return st.Bavail * uint64(st.Bsize), st.Blocks * uint64(st.Bsize), nil
++}
+-- 
+2.43.0
+

@@ -1,0 +1,1035 @@
+From 3d1ba8aa9fb08400870bcfa67f21e5af812c0314 Mon Sep 17 00:00:00 2001
+From: Corvid <corvid@example.invalid>
+Date: Fri, 20 Nov 2026 11:24:09 +0300
+Subject: [PATCH] FFmpeg 9.0.2 for Corvid (redistributable)
+
+- contrib/ffmpeg-9.0-jsonstats.patch: the JSON progress report ported to
+  the threaded fftools of FFmpeg 7 and later (same lines and fields).
+- contrib/ffmpeg-9.0-hls.patch: the HLS muxer extensions for 9.0.
+- Dockerfile.ubuntu.corvid: no --enable-nonfree; the CUDA filters are
+  built with clang (--enable-cuda-llvm), no CUDA toolkit and no
+  libfdk-aac/libnpp. NVENC/NVDEC headers 12.1.14.0 (driver >= 530).
+  The 'bundle' target produces a self-contained ffmpeg ($ORIGIN/lib)
+  for the Corvid update package.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ Build.ubuntu.corvid.env            |   5 +
+ Dockerfile.ubuntu.corvid           | 156 ++++++++
+ contrib/ffmpeg-9.0-hls.patch       | 224 +++++++++++
+ contrib/ffmpeg-9.0-jsonstats.patch | 596 +++++++++++++++++++++++++++++
+ 4 files changed, 981 insertions(+)
+ create mode 100644 Build.ubuntu.corvid.env
+ create mode 100644 Dockerfile.ubuntu.corvid
+ create mode 100644 contrib/ffmpeg-9.0-hls.patch
+ create mode 100644 contrib/ffmpeg-9.0-jsonstats.patch
+
+diff --git a/Build.ubuntu.corvid.env b/Build.ubuntu.corvid.env
+new file mode 100644
+index 0000000..8253a2f
+--- /dev/null
++++ b/Build.ubuntu.corvid.env
+@@ -0,0 +1,5 @@
++# FFMPEG 9 FOR CORVID (redistributable, NVENC/NVDEC + CUDA filters via clang)
++OS_NAME=ubuntu
++OS_VERSION=24.04
++FFNVCODEC_VERSION=12.1.14.0
++FFMPEG_VERSION=9.0.2
+diff --git a/Dockerfile.ubuntu.corvid b/Dockerfile.ubuntu.corvid
+new file mode 100644
+index 0000000..50a9746
+--- /dev/null
++++ b/Dockerfile.ubuntu.corvid
+@@ -0,0 +1,156 @@
++# FFmpeg 9.0 for Corvid (datarhei Restreamer fork) with NVIDIA NVENC/NVDEC and CUDA filters.
++#
++# Redistributable: no --enable-nonfree. The CUDA filters (scale_cuda, overlay_cuda, ...) are
++# compiled with clang (--enable-cuda-llvm) instead of nvcc, libfdk-aac is not used (Corvid uses
++# the native aac encoder). The build needs no CUDA toolkit: NVENC/NVDEC/CUDA are loaded from the
++# driver at run time (nv-codec-headers), the NVIDIA container toolkit mounts the driver libraries.
++#
++#   docker build -f Dockerfile.ubuntu.corvid -t corvid-ffmpeg:9.0.2 .
++
++ARG BUILD_IMAGE=ubuntu:24.04
++# The runtime stays the CUDA runtime image Corvid already runs on (same Ubuntu 24.04 base).
++ARG DEPLOY_IMAGE=nvidia/cuda:12.6.1-runtime-ubuntu24.04
++
++FROM $BUILD_IMAGE AS builder
++
++# 12.1.14.0 needs NVIDIA driver >= 530 (the 580 branch is the last one for Pascal/Maxwell/Volta)
++ARG FFNVCODEC_VERSION=12.1.14.0
++ARG FFMPEG_VERSION=9.0.2
++ARG BUILD_DATE=1970-01-01T00:00:00Z
++ARG BUILD_COMMIT=unknown
++
++ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
++ENV SRC=/usr/local
++ENV DEBIAN_FRONTEND=noninteractive
++
++RUN apt-get update -y && \
++  apt-get install -y --no-install-recommends \
++  ca-certificates \
++  pkg-config \
++  curl \
++  xz-utils \
++  nasm \
++  build-essential \
++  clang \
++  llvm \
++  libssl-dev \
++  libv4l-dev \
++  libasound2-dev \
++  libx264-dev \
++  libx265-dev \
++  librav1e-dev \
++  libaom-dev \
++  libdav1d-dev \
++  libvpx-dev \
++  libmp3lame-dev \
++  libopus-dev \
++  libvorbis-dev \
++  libogg-dev \
++  libfreetype-dev \
++  libharfbuzz-dev \
++  libsrt-openssl-dev \
++  libxml2-dev \
++  libxcb1-dev \
++  libxcb-xfixes0-dev \
++  libxcb-shm0-dev \
++  libxcb-shape0-dev \
++  zlib1g-dev
++
++RUN mkdir -p /dist && cd /dist && \
++  curl -fsSLO https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz && \
++  curl -fsSLO https://github.com/FFmpeg/nv-codec-headers/releases/download/n${FFNVCODEC_VERSION}/nv-codec-headers-${FFNVCODEC_VERSION}.tar.gz && \
++  tar -xJf ffmpeg-${FFMPEG_VERSION}.tar.xz && \
++  tar -xzf nv-codec-headers-${FFNVCODEC_VERSION}.tar.gz && \
++  rm ffmpeg-${FFMPEG_VERSION}.tar.xz nv-codec-headers-${FFNVCODEC_VERSION}.tar.gz && \
++  make -C nv-codec-headers-${FFNVCODEC_VERSION} install
++
++COPY ./contrib /contrib
++
++RUN cd /dist/ffmpeg-${FFMPEG_VERSION} && \
++  patch -p1 < /contrib/ffmpeg-9.0-jsonstats.patch && \
++  patch -p1 < /contrib/ffmpeg-9.0-hls.patch && \
++  ./configure \
++  --extra-version="corvid-${BUILD_COMMIT}" \
++  --prefix="${SRC}" \
++  --enable-gpl \
++  --enable-version3 \
++  --enable-openssl \
++  --enable-libxml2 \
++  --enable-ffnvcodec \
++  --enable-cuda-llvm \
++  --enable-cuvid \
++  --enable-nvdec \
++  --enable-nvenc \
++  --enable-libv4l2 \
++  --enable-libfreetype \
++  --enable-libharfbuzz \
++  --enable-alsa \
++  --enable-libsrt \
++  --enable-libx264 \
++  --enable-libx265 \
++  --enable-libvpx \
++  --enable-libmp3lame \
++  --enable-libopus \
++  --enable-libvorbis \
++  --enable-libdav1d \
++  --enable-librav1e \
++  --enable-libaom \
++  --enable-libxcb \
++  --disable-ffplay \
++  --disable-ffprobe \
++  --disable-debug \
++  --disable-doc && \
++  make -j$(nproc) && \
++  make install && \
++  hash -r && \
++  ffmpeg -hide_banner -buildconf | grep -q -- '--enable-nonfree' && { echo "ERROR: nonfree build"; exit 1; } || true
++
++RUN mkdir -p /ffmpeglibs && \
++  ldd /usr/local/bin/ffmpeg | grep -o -e '/lib/[a-z0-9_]*-linux-gnu/[^ ]*' | xargs -I % cp -v % /ffmpeglibs
++
++# Self-contained FFmpeg for the Corvid update package (update.sh mounts it at /core/ffmpeg):
++# the binary looks for its libraries next to itself ($ORIGIN/lib, DT_RPATH so it also applies
++# to the libraries' own dependencies), glibc stays the container's (same Ubuntu 24.04).
++#   docker build --target bundle -o type=local,dest=out -f Dockerfile.ubuntu.corvid .
++FROM builder AS bundle-build
++RUN apt-get install -y --no-install-recommends patchelf && \
++  mkdir -p /bundle/lib && \
++  cp /usr/local/bin/ffmpeg /bundle/ffmpeg && \
++  ldd /usr/local/bin/ffmpeg | grep -o -e '/lib/[a-z0-9_]*-linux-gnu/[^ ]*' | \
++    grep -v -E '/(libc|libm|libdl|libpthread|librt|libresolv|libmvec|ld-linux-x86-64)\.so' | \
++    xargs -I % cp -L % /bundle/lib/ && \
++  patchelf --force-rpath --set-rpath '$ORIGIN/lib' /bundle/ffmpeg && \
++  strip --strip-unneeded /bundle/lib/*.so* && \
++  /bundle/ffmpeg -hide_banner -version | head -n 1 && \
++  cd /bundle && sha256sum ffmpeg lib/* > SHA256SUMS
++
++FROM scratch AS bundle
++COPY --from=bundle-build /bundle /
++
++FROM $DEPLOY_IMAGE
++
++COPY --from=builder /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg
++COPY --from=builder /ffmpeglibs /ffmpeglibs
++
++ENV DEBIAN_FRONTEND=noninteractive
++
++# Fail the build if the filters the Corvid GPU canvas needs are missing.
++RUN echo "/ffmpeglibs" > /etc/ld.so.conf.d/ffmpeg.conf && \
++  ldconfig && \
++  apt-get update && \
++  apt-get install -y --no-install-recommends ca-certificates openssl tzdata v4l-utils fbset libasound2t64 && \
++  rm -rf /var/lib/apt/lists/* && \
++  ffmpeg -hide_banner -buildconf && \
++  for f in scale_cuda overlay_cuda; do \
++    ffmpeg -hide_banner -filters | grep -q " $f " || { echo "ERROR: FFmpeg has no $f"; exit 1; }; \
++  done && \
++  for e in h264_nvenc hevc_nvenc; do \
++    ffmpeg -hide_banner -encoders | grep -q " $e " || { echo "ERROR: FFmpeg has no $e"; exit 1; }; \
++  done
++
++ENV NVIDIA_VISIBLE_DEVICES=all
++ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
++
++WORKDIR /tmp
++ENTRYPOINT ["/usr/local/bin/ffmpeg"]
++CMD ["-version"]
+diff --git a/contrib/ffmpeg-9.0-hls.patch b/contrib/ffmpeg-9.0-hls.patch
+new file mode 100644
+index 0000000..6f7c9d3
+--- /dev/null
++++ b/contrib/ffmpeg-9.0-hls.patch
+@@ -0,0 +1,224 @@
++From ed9d293c1c9de42343ed160be95728e5df62b7d4 Mon Sep 17 00:00:00 2001
++From: Corvid <corvid@example.invalid>
++Date: Fri, 20 Nov 2026 10:39:57 +0300
++Subject: [PATCH] HLS extensions (ffmpeg 9.0)
++
++Port of the datarhei HLS muxer extensions (Ingo Oppermann, v6 for 6.1):
++bitrate estimation for streamcopy and the hls.streammap line. The
++estimation now skips packets without pts and intervals without data.
++---
++ README.HLS.md        | 48 +++++++++++++++++++++++++
++ libavformat/hlsenc.c | 86 +++++++++++++++++++++++++++++++++++++++++---
++ 2 files changed, 129 insertions(+), 5 deletions(-)
++ create mode 100644 README.HLS.md
++
++diff --git a/README.HLS.md b/README.HLS.md
++new file mode 100644
++index 0000000..5462338
++--- /dev/null
+++++ b/README.HLS.md
++@@ -0,0 +1,48 @@
+++# HLS Muxer Extensions
+++
+++Various extensions to the HLS muxer `hlsenc.c`.
+++
+++## Bitrate Estimation
+++
+++If streamcopy is used, the muxer doesn't get always information about the bitrate. However, this is required if you want
+++to write a manifest with multiple bitrate substreams. This patch adds an estimator for the bitrate (based on data written
+++between two keyframes) which kicks in if there's no bitrate provided, e.g.
+++
+++```
+++ffmpeg \
+++  -re -i https://demo.datarhei.com/memfs/1f33d538-d714-4c7e-9559-46ddb8118f03.m3u8 \
+++  -c:v:0 copy -bsf:v:0 h264_metadata \
+++  -map 0:v:0 \
+++  -f hls \
+++  -start_number 0 -hls_time 2 -hls_list_size 6 -hls_delete_threshold 12 \
+++  -hls_flags append_list+delete_segments+program_date_time+independent_segments \
+++  -hls_segment_type mpegts -hls_segment_filename 'http://localhost:8080/memfs/%v_%04d.ts' \
+++  -master_pl_name main.m3u8 -master_pl_publish_rate 5 -var_stream_map v:0 -y \
+++  -method PUT -http_persistent 1 -ignore_io_errors 1 'http://localhost:8080/memfs/%v.m3u8'
+++```
+++
+++Without the patch, a message like `Bandwidth info not available, set audio and video bitrates` will appear.
+++
+++## Variant Stream Map
+++
+++From the outside of the muxer, everything is one output even if the muxer creates several variants. This patch prints a
+++map of the variants to `stderr` as JSON on one line, similar to this one:
+++
+++```
+++hls.streammap:{"address":"http://127.0.0.1:8080/memfs/live/%v.m3u8","variants":[{"variant":0,"address":"http://127.0.0.1:8080/memfs/live/0.m3u8","streams":[0,2]},{"variant":1,"address":"http://127.0.0.1:8080/memfs/live/1.m3u8","streams":[1,3]}]}
+++```
+++
+++The prefix is `hls.streammap`.
+++
+++It lists all variant substreams and which output streams are used. The `streams` array lists the indexs of the output streams from the stream mapping. For the
+++above HLS stream map, this is the FFmpeg stream map:
+++
+++```
+++Stream mapping:
+++  Stream #0:0 -> #0:0 (copy)
+++  Stream #1:0 -> #0:1 (copy)
+++  Stream #2:0 -> #0:2 (pcm_u8 (native) -> aac (native))
+++  Stream #2:0 -> #0:3 (pcm_u8 (native) -> aac (native))
+++```
+++
+++In the command, the `-var_stream_map` option had the value `v:0,a:0 v:1,a:1`.
++diff --git a/libavformat/hlsenc.c b/libavformat/hlsenc.c
++index 50f19f9..47bfd70 100644
++--- a/libavformat/hlsenc.c
+++++ b/libavformat/hlsenc.c
++@@ -126,6 +126,7 @@ typedef struct VariantStream {
++     AVIOContext *out;
++     AVIOContext *out_single_file;
++     int packets_written;
+++    uint64_t bytes_written;
++     int init_range_length;
++     uint8_t *temp_buffer;
++     uint8_t *init_buffer;
++@@ -140,6 +141,8 @@ typedef struct VariantStream {
++     double dpp;           // duration per packet
++     int64_t start_pts;
++     int64_t end_pts;
+++    int64_t scaled_start_pts;
+++    int64_t scaled_cur_pts;
++     int64_t video_lastpos;
++     double duration;      // last segment duration computed so far, in seconds
++     int64_t start_pos;    // last segment starting position
++@@ -1370,7 +1373,7 @@ static int create_master_playlist(AVFormatContext *s,
++     AVStream *vid_st, *aud_st;
++     AVDictionary *options = NULL;
++     unsigned int i, j;
++-    int ret, bandwidth, avg_bandwidth;
+++    int ret, bandwidth, avg_bandwidth, st_bandwidth, est_bandwidth;
++     const char *m3u8_rel_name = NULL;
++     const char *vtt_m3u8_rel_name = NULL;
++     const char *ccgroup;
++@@ -1487,10 +1490,37 @@ static int create_master_playlist(AVFormatContext *s,
++         } else {
++             bandwidth = 0;
++             avg_bandwidth = 0;
++-            if (vid_st)
++-                bandwidth += get_stream_bit_rate(vid_st);
++-            if (aud_st)
++-                bandwidth += get_stream_bit_rate(aud_st);
+++            est_bandwidth = 0;
+++
+++            if (vid_st) {
+++                st_bandwidth = get_stream_bit_rate(vid_st);
+++                if (st_bandwidth == 0) {
+++                    est_bandwidth = 1;
+++                } else {
+++                    bandwidth += st_bandwidth;
+++                }
+++            }
+++            if (aud_st) {
+++                st_bandwidth = get_stream_bit_rate(aud_st);
+++                if (st_bandwidth == 0) {
+++                    est_bandwidth = 1;
+++                } else {
+++                    bandwidth += st_bandwidth;
+++                }
+++            }
+++
+++            if (est_bandwidth != 0 && vs->scaled_cur_pts != AV_NOPTS_VALUE &&
+++                vs->scaled_start_pts != AV_NOPTS_VALUE &&
+++                vs->scaled_cur_pts > vs->scaled_start_pts) {
+++                // Estimate bandwidth (streamcopy doesn't always know the bitrate)
+++                bandwidth = (int)round((double)vs->bytes_written / (av_q2d(AV_TIME_BASE_Q) * (vs->scaled_cur_pts - vs->scaled_start_pts)) * 8);
+++
+++                // Reset counters
+++                vs->bytes_written = 0;
+++                vs->scaled_start_pts = vs->scaled_cur_pts;
+++            }
+++
+++            // Add 10% of the bandwidth to itself
++             bandwidth += bandwidth / 10;
++         }
++ 
++@@ -2463,6 +2493,16 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
++         return AVERROR(ENOMEM);
++     }
++ 
+++    if (pkt->pts != AV_NOPTS_VALUE) {
+++        int64_t pts = av_rescale_q(pkt->pts, st->time_base, AV_TIME_BASE_Q);
+++
+++        if (vs->scaled_start_pts == AV_NOPTS_VALUE)
+++            vs->scaled_start_pts = pts;
+++
+++        if (vs->scaled_cur_pts == AV_NOPTS_VALUE || pts > vs->scaled_cur_pts)
+++            vs->scaled_cur_pts = pts;
+++    }
+++
++     end_pts = hls->recording_time * vs->number;
++ 
++     if (vs->sequence - vs->nb_entries > hls->start_sequence && hls->init_time > 0) {
++@@ -2691,6 +2731,7 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
++     }
++ 
++     vs->packets_written++;
+++    vs->bytes_written += (uint64_t)pkt->size;
++     if (oc->pb) {
++         ret = ff_write_chained(oc, stream_index, pkt, s, 0);
++         if (hls->ignore_io_errors)
++@@ -2872,6 +2913,36 @@ failed:
++     return 0;
++ }
++ 
+++static void print_stream_mapping(AVFormatContext *s) {
+++    int i = 0, j = 0;
+++    HLSContext *hls = s->priv_data;
+++    VariantStream *vs = NULL;
+++    AVStream *avs = NULL;
+++
+++    fprintf(stderr, "hls.streammap:{\"address\":\"%s\",\"variants\":[", s->url);
+++    for (i = 0; i < hls->nb_varstreams; i++) {
+++        vs = &hls->var_streams[i];
+++
+++        fprintf(stderr, "{\"variant\":%d,\"address\":\"%s\",\"streams\":[", i, vs->m3u8_name);
+++        for (j = 0; j < vs->nb_streams; j++) {
+++            avs = vs->streams[j];
+++
+++            fprintf(stderr, "%d", avs->index);
+++
+++            if (j != vs->nb_streams-1) {
+++                fprintf(stderr, ",");
+++            }
+++        }
+++        fprintf(stderr, "]}");
+++
+++        if (i != hls->nb_varstreams-1) {
+++            fprintf(stderr, ",");
+++        }
+++    }
+++    fprintf(stderr, "]}\n");
+++
+++    return;
+++}
++ 
++ static int hls_init(AVFormatContext *s)
++ {
++@@ -2978,6 +3049,8 @@ static int hls_init(AVFormatContext *s)
++         vs->sequence  = hls->start_sequence;
++         vs->start_pts = AV_NOPTS_VALUE;
++         vs->end_pts   = AV_NOPTS_VALUE;
+++        vs->scaled_start_pts = AV_NOPTS_VALUE;
+++        vs->scaled_cur_pts = AV_NOPTS_VALUE;
++         vs->current_segment_final_filename_fmt[0] = '\0';
++         vs->initial_prog_date_time = initial_program_date_time;
++ 
++@@ -3123,6 +3196,9 @@ static int hls_init(AVFormatContext *s)
++         vs->number++;
++     }
++ 
+++    // Write out HLS stream mapping
+++    print_stream_mapping(s);
+++
++     return ret;
++ }
++ 
++-- 
++2.43.0
++
+diff --git a/contrib/ffmpeg-9.0-jsonstats.patch b/contrib/ffmpeg-9.0-jsonstats.patch
+new file mode 100644
+index 0000000..36aa411
+--- /dev/null
++++ b/contrib/ffmpeg-9.0-jsonstats.patch
+@@ -0,0 +1,596 @@
++From 9eaf131df3c74ed364829caf72ab924fcb6d57c7 Mon Sep 17 00:00:00 2001
++From: Corvid <corvid@example.invalid>
++Date: Fri, 20 Nov 2026 10:50:47 +0300
++Subject: [PATCH] JSON progress report (ffmpeg 9.0)
++
++Port of the datarhei JSON progress report (Ingo Oppermann, v29 for 6.1)
++to the threaded fftools of FFmpeg 7 and later. The lines and fields the
++Restreamer core parses are unchanged:
++
++  ffmpeg.inputs:[...]    after the inputs are opened
++  ffmpeg.mapping:{...}   before the first progress line (graphs: [])
++  ffmpeg.outputs:[...]   once all muxers wrote their header
++  ffmpeg.progress:{...}  every -stats_period
++
++The per stream counters live in a JsonStats block of the public
++InputStream/OutputStream, updated by the demuxer and muxer threads.
++Changes: the framerate/GOP estimation starts at the second keyframe (the
++first interval used to be measured from timestamp 0), the hundredths of
++the time are zero padded, strings are JSON escaped.
++---
++ fftools/ffmpeg.c       | 407 ++++++++++++++++++++++++++++++++++++++++-
++ fftools/ffmpeg.h       |  28 +++
++ fftools/ffmpeg_demux.c |   4 +
++ fftools/ffmpeg_mux.c   |   3 +
++ fftools/ffmpeg_opt.c   |   6 +
++ 5 files changed, 447 insertions(+), 1 deletion(-)
++
++diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
++index b394243..bf03568 100644
++--- a/fftools/ffmpeg.c
+++++ b/fftools/ffmpeg.c
++@@ -69,6 +69,8 @@
++ #endif
++ 
++ #include "libavutil/bprint.h"
+++#include "libavutil/channel_layout.h"
+++#include "libavutil/pixdesc.h"
++ #include "libavutil/dict.h"
++ #include "libavutil/mem.h"
++ #include "libavutil/time.h"
++@@ -82,6 +84,7 @@
++ #include "compat/android/binder.h"
++ #endif
++ #include "ffmpeg.h"
+++#include "ffmpeg_mux.h"
++ #include "ffmpeg_sched.h"
++ #include "ffmpeg_utils.h"
++ #include "graph/graphprint.h"
++@@ -569,7 +572,7 @@ void update_benchmark(const char *fmt, ...)
++     }
++ }
++ 
++-static void print_report(int is_last_report, int64_t timer_start, int64_t cur_time, int64_t pts)
+++static void print_default_report(int is_last_report, int64_t timer_start, int64_t cur_time, int64_t pts)
++ {
++     AVBPrint buf, buf_script;
++     int64_t total_size = of_filesize(output_files[0]);
++@@ -731,6 +734,408 @@ static void print_report(int is_last_report, int64_t timer_start, int64_t cur_ti
++     first_report = 0;
++ }
++ 
+++/*
+++ * JSON progress report (datarhei Restreamer / Corvid).
+++ *
+++ * The lines printed here are parsed by the Restreamer core:
+++ *   ffmpeg.inputs:[...]     once, after the inputs are opened
+++ *   ffmpeg.mapping:{...}    once, before the first progress report
+++ *   ffmpeg.outputs:[...]    once, before the first progress report
+++ *   ffmpeg.progress:{...}   every stats_period
+++ */
+++
+++void jsonstats_update(JsonStats *js, const AVPacket *pkt, AVRational tb, int is_key)
+++{
+++    js->nb_packets++;
+++    js->data_size += pkt->size;
+++
+++    if (!is_key)
+++        return;
+++
+++    js->nb_keyframes++;
+++
+++    if (pkt->dts == AV_NOPTS_VALUE)
+++        return;
+++
+++    {
+++        int64_t ts = av_rescale_q(pkt->dts, tb, AV_TIME_BASE_Q);
+++
+++        // framerate and GOP size estimation between two keyframes
+++        if (js->have_keyframe && ts - js->last_keyframe_dts > 0) {
+++            double gopsize   = (double)(js->nb_packets - js->last_keyframe_pktnb);
+++            double framerate = gopsize / (double)(ts - js->last_keyframe_dts) * (double)AV_TIME_BASE;
+++
+++            if (js->min_framerate == 0.0 || framerate < js->min_framerate)
+++                js->min_framerate = framerate;
+++            if (js->max_framerate == 0.0 || framerate > js->max_framerate)
+++                js->max_framerate = framerate;
+++
+++            if (js->min_gopsize == 0.0 || gopsize < js->min_gopsize)
+++                js->min_gopsize = gopsize;
+++            if (js->max_gopsize == 0.0 || gopsize > js->max_gopsize)
+++                js->max_gopsize = gopsize;
+++
+++            js->nsamples_average++;
+++
+++            js->avg_framerate = ((js->nsamples_average - 1) * js->avg_framerate + framerate) / (double)js->nsamples_average;
+++            js->avg_gopsize   = ((js->nsamples_average - 1) * js->avg_gopsize   + gopsize)   / (double)js->nsamples_average;
+++        }
+++
+++        js->have_keyframe       = 1;
+++        js->last_keyframe_dts   = ts;
+++        js->last_keyframe_pktnb = js->nb_packets;
+++    }
+++}
+++
+++static void json_string(AVBPrint *buf, const char *str)
+++{
+++    av_bprint_chars(buf, '"', 1);
+++
+++    for (const unsigned char *c = (const unsigned char *)(str ? str : ""); *c; c++) {
+++        if (*c == '"' || *c == '\\')
+++            av_bprintf(buf, "\\%c", *c);
+++        else if (*c < 0x20)
+++            av_bprintf(buf, "\\u%04x", *c);
+++        else
+++            av_bprint_chars(buf, *c, 1);
+++    }
+++
+++    av_bprint_chars(buf, '"', 1);
+++}
+++
+++static void json_print_line(AVBPrint *buf)
+++{
+++    if (av_bprint_is_complete(buf)) {
+++        fprintf(stderr, "%s\n", buf->str);
+++        fflush(stderr);
+++    }
+++
+++    av_bprint_finalize(buf, NULL);
+++}
+++
+++static const char *json_language(AVDictionary *metadata)
+++{
+++    const AVDictionaryEntry *lang = av_dict_get(metadata, "language", NULL, 0);
+++
+++    return lang ? lang->value : "und";
+++}
+++
+++static void json_codecpar(AVBPrint *buf, const AVCodecParameters *par,
+++                          AVRational avg_frame_rate)
+++{
+++    if (par->codec_type == AVMEDIA_TYPE_VIDEO) {
+++        float fps = 0;
+++        const char *pix_fmt = par->format == AV_PIX_FMT_NONE ? NULL :
+++                              av_get_pix_fmt_name(par->format);
+++
+++        if (avg_frame_rate.den && avg_frame_rate.num)
+++            fps = av_q2d(avg_frame_rate);
+++
+++        av_bprintf(buf, ",\"fps\":%f,\"pix_fmt\":", fps);
+++        json_string(buf, pix_fmt ? pix_fmt : "none");
+++        av_bprintf(buf, ",\"width\":%d,\"height\":%d", par->width, par->height);
+++    } else if (par->codec_type == AVMEDIA_TYPE_AUDIO) {
+++        char layout[128] = "";
+++
+++        av_channel_layout_describe(&par->ch_layout, layout, sizeof(layout));
+++
+++        av_bprintf(buf, ",\"sampling_hz\":%d,\"layout\":", par->sample_rate);
+++        json_string(buf, layout);
+++        av_bprintf(buf, ",\"channels\":%d", par->ch_layout.nb_channels);
+++    }
+++}
+++
+++void print_json_inputs(void)
+++{
+++    AVBPrint buf;
+++    int first = 1;
+++
+++    if (print_jsonstats != 1)
+++        return;
+++
+++    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+++    av_bprintf(&buf, "ffmpeg.inputs:[");
+++
+++    for (int i = 0; i < nb_input_files; i++) {
+++        InputFile       *f   = input_files[i];
+++        AVFormatContext *ctx = f->ctx;
+++        float duration = 0;
+++
+++        if (ctx->duration != AV_NOPTS_VALUE)
+++            duration = (float)(ctx->duration +
+++                               (ctx->duration <= INT64_MAX - 5000 ? 5000 : 0)) /
+++                       (float)AV_TIME_BASE;
+++
+++        for (int j = 0; j < f->nb_streams; j++) {
+++            InputStream             *ist = f->streams[j];
+++            const AVCodecParameters *par = ist->par;
+++
+++            av_bprintf(&buf, "%s{\"url\":", first ? "" : ",");
+++            json_string(&buf, ctx->url);
+++            av_bprintf(&buf, ",\"format\":");
+++            json_string(&buf, ctx->iformat->name);
+++            av_bprintf(&buf, ",\"index\":%d,\"stream\":%d,\"type\":",
+++                       ist->file->index, ist->index);
+++            json_string(&buf, av_get_media_type_string(par->codec_type));
+++            av_bprintf(&buf, ",\"codec\":");
+++            json_string(&buf, avcodec_get_name(par->codec_id));
+++            av_bprintf(&buf, ",\"coder\":");
+++            json_string(&buf, ist->dec ? ist->dec->name : "unknown");
+++            av_bprintf(&buf, ",\"bitrate_kbps\":%" PRId64 ",\"duration_sec\":%f,\"language\":",
+++                       par->bit_rate / 1000, duration);
+++            json_string(&buf, json_language(ist->st->metadata));
+++            av_bprintf(&buf, ",\"profile\":%d,\"level\":%d", par->profile, par->level);
+++
+++            json_codecpar(&buf, par, ist->st->avg_frame_rate);
+++
+++            av_bprintf(&buf, "}");
+++            first = 0;
+++        }
+++    }
+++
+++    av_bprintf(&buf, "]");
+++    json_print_line(&buf);
+++}
+++
+++static void print_json_outputs(void)
+++{
+++    AVBPrint buf;
+++    int first = 1;
+++
+++    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+++    av_bprintf(&buf, "ffmpeg.outputs:[");
+++
+++    for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
+++        Muxer                   *mux = (Muxer*)ost->file;
+++        AVFormatContext         *ctx = mux->fc;
+++        AVStream                *st  = ost->st;
+++        const AVCodecParameters *par = st->codecpar;
+++        const AVCodecContext    *enc = ost->enc ? ost->enc->enc_ctx : NULL;
+++
+++        av_bprintf(&buf, "%s{\"url\":", first ? "" : ",");
+++        json_string(&buf, ctx->url);
+++        av_bprintf(&buf, ",\"format\":");
+++        json_string(&buf, ctx->oformat->name);
+++        av_bprintf(&buf, ",\"index\":%d,\"stream\":%d,\"type\":",
+++                   ost->file->index, ost->index);
+++        json_string(&buf, av_get_media_type_string(par->codec_type));
+++        av_bprintf(&buf, ",\"codec\":");
+++        json_string(&buf, avcodec_get_name(par->codec_id));
+++        av_bprintf(&buf, ",\"coder\":");
+++        json_string(&buf, !enc ? "copy" : (enc->codec ? enc->codec->name : "unknown"));
+++        av_bprintf(&buf, ",\"bitrate_kbps\":%" PRId64 ",\"duration_sec\":%f,\"language\":",
+++                   (enc ? enc->bit_rate : par->bit_rate) / 1000, 0.0);
+++        json_string(&buf, json_language(st->metadata));
+++        av_bprintf(&buf, ",\"profile\":%d,\"level\":%d", par->profile, par->level);
+++
+++        json_codecpar(&buf, par, st->avg_frame_rate);
+++
+++        av_bprintf(&buf, "}");
+++        first = 0;
+++    }
+++
+++    av_bprintf(&buf, "]");
+++    json_print_line(&buf);
+++}
+++
+++static void print_json_stream_maps(void)
+++{
+++    AVBPrint buf;
+++    int first = 1;
+++
+++    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+++
+++    // The filter graphs run in their own threads since FFmpeg 7 and are not
+++    // accessible from here, only the mapping is reported.
+++    av_bprintf(&buf, "ffmpeg.mapping:{\"graphs\":[],\"mapping\":[");
+++
+++    for (InputStream *ist = ist_iter(NULL); ist; ist = ist_iter(ist)) {
+++        for (int i = 0; i < ist->nb_filters; i++) {
+++            if (filtergraph_is_simple(ist->filters[i]->graph))
+++                continue;
+++
+++            av_bprintf(&buf, "%s{\"input\":{\"index\":%d,\"stream\":%d},\"graph\":{\"index\":%d,\"name\":",
+++                       first ? "" : ",", ist->file->index, ist->st->index,
+++                       ist->filters[i]->graph->index);
+++            json_string(&buf, ist->filters[i]->name);
+++            av_bprintf(&buf, "},\"output\":null}");
+++            first = 0;
+++        }
+++    }
+++
+++    for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
+++        av_bprintf(&buf, "%s", first ? "" : ",");
+++        first = 0;
+++
+++        if (ost->attachment_filename) {
+++            av_bprintf(&buf, "{\"input\":null,\"file\":");
+++            json_string(&buf, ost->attachment_filename);
+++            av_bprintf(&buf, ",\"output\":{\"index\":%d,\"stream\":%d}}",
+++                       ost->file->index, ost->index);
+++            continue;
+++        }
+++
+++        if (ost->filter && !filtergraph_is_simple(ost->filter->graph)) {
+++            av_bprintf(&buf, "{\"input\":null,\"graph\":{\"index\":%d,\"name\":",
+++                       ost->filter->graph->index);
+++            json_string(&buf, ost->filter->name);
+++            av_bprintf(&buf, "},\"output\":{\"index\":%d,\"stream\":%d}}",
+++                       ost->file->index, ost->index);
+++            continue;
+++        }
+++
+++        av_bprintf(&buf, "{");
+++        if (ost->ist)
+++            av_bprintf(&buf, "\"input\":{\"index\":%d,\"stream\":%d},",
+++                       ost->ist->file->index, ost->ist->st->index);
+++        else
+++            av_bprintf(&buf, "\"input\":null,");
+++        av_bprintf(&buf, "\"output\":{\"index\":%d,\"stream\":%d},\"copy\":%s}",
+++                   ost->file->index, ost->index, !ost->enc ? "true" : "false");
+++    }
+++
+++    av_bprintf(&buf, "]}");
+++    json_print_line(&buf);
+++}
+++
+++static void json_stats(AVBPrint *buf, const JsonStats *js, uint64_t frames)
+++{
+++    av_bprintf(buf, "\"framerate\":{\"min\":%.3f,\"max\":%.3f,\"avg\":%.3f},",
+++               js->min_framerate, js->max_framerate, js->avg_framerate);
+++    av_bprintf(buf, "\"gop\":{\"min\":%.3f,\"max\":%.3f,\"avg\":%.3f},",
+++               js->min_gopsize, js->max_gopsize, js->avg_gopsize);
+++    av_bprintf(buf, "\"frame\":%" PRIu64 ",\"keyframe\":%" PRIu64 ",\"packet\":%" PRIu64 ",",
+++               frames == 0 ? js->nb_packets : frames, js->nb_keyframes, js->nb_packets);
+++}
+++
+++static void print_json_report(int is_last_report, int64_t timer_start, int64_t cur_time, int64_t pts)
+++{
+++    static int64_t last_time = -1;
+++    static int     header_done = 0;
+++    AVBPrint buf;
+++    uint64_t total_size = 0;
+++    uint64_t nb_frames_dup = 0, nb_frames_drop = 0;
+++    uint64_t first_frame_number = 0, first_packet_number = 0;
+++    int      first_vid = 1, first = 1;
+++    float    first_q = -1;
+++    double   speed;
+++    float    t;
+++
+++    if (!header_done) {
+++        // Report the outputs once all muxers have written their headers,
+++        // the core expects them before the first progress line.
+++        if (atomic_load(&nb_output_dumped) < nb_output_files) {
+++            if (!is_last_report)
+++                return;
+++        } else {
+++            print_json_stream_maps();
+++            print_json_outputs();
+++            header_done = 1;
+++        }
+++    }
+++
+++    if (!is_last_report) {
+++        if (last_time != -1 && (cur_time - last_time) < stats_period / 2)
+++            return;
+++        last_time = cur_time;
+++    }
+++
+++    t = (cur_time - timer_start) / 1000000.0;
+++
+++    av_bprint_init(&buf, 0, AV_BPRINT_SIZE_UNLIMITED);
+++
+++    av_bprintf(&buf, "ffmpeg.progress:{\"inputs\":[");
+++
+++    for (InputStream *ist = ist_iter(NULL); ist; ist = ist_iter(ist)) {
+++        const JsonStats *js = &ist->jstats;
+++
+++        av_bprintf(&buf, "%s{\"index\":%d,\"stream\":%d,", first ? "" : ",",
+++                   ist->file->index, ist->index);
+++        json_stats(&buf, js, ist->decoder ? ist->decoder->frames_decoded : 0);
+++        av_bprintf(&buf, "\"size_kb\":%.0f,\"size_bytes\":%" PRIu64 "}",
+++                   js->data_size / 1024.0, js->data_size);
+++        first = 0;
+++    }
+++
+++    av_bprintf(&buf, "],\"outputs\":[");
+++    first = 1;
+++
+++    for (OutputStream *ost = ost_iter(NULL); ost; ost = ost_iter(ost)) {
+++        const JsonStats *js = &ost->jstats;
+++        const float q = ost->enc ? atomic_load(&ost->quality) / (float)FF_QP2LAMBDA : -1;
+++        uint64_t frames = ost->enc ? ost->enc->frames_encoded : 0;
+++        int extradata_size = ost->enc ? ost->enc->enc_ctx->extradata_size :
+++                                        ost->st->codecpar->extradata_size;
+++
+++        av_bprintf(&buf, "%s{\"index\":%d,\"stream\":%d,", first ? "" : ",",
+++                   ost->file->index, ost->index);
+++        json_stats(&buf, js, frames);
+++
+++        if (ost->type == AVMEDIA_TYPE_VIDEO) {
+++            av_bprintf(&buf, "\"q\":%.1f,", q);
+++
+++            if (first_vid) {
+++                first_frame_number  = frames == 0 ? js->nb_packets : frames;
+++                first_packet_number = js->nb_packets;
+++                first_q             = q;
+++                first_vid           = 0;
+++            }
+++        }
+++
+++        if (ost->filter) {
+++            nb_frames_dup  += atomic_load(&ost->filter->nb_frames_dup);
+++            nb_frames_drop += atomic_load(&ost->filter->nb_frames_drop);
+++        }
+++
+++        total_size += js->data_size;
+++
+++        av_bprintf(&buf, "\"size_kb\":%.0f,\"size_bytes\":%" PRIu64 ",\"extradata_size_bytes\":%d}",
+++                   js->data_size / 1024.0, js->data_size, extradata_size);
+++        first = 0;
+++    }
+++
+++    av_bprintf(&buf, "],");
+++
+++    av_bprintf(&buf, "\"frame\":%" PRIu64 ",\"packet\":%" PRIu64 ",\"q\":%.1f,",
+++               first_frame_number, first_packet_number, first_q);
+++    av_bprintf(&buf, "\"size_kb\":%.0f,\"size_bytes\":%" PRIu64 ",",
+++               total_size / 1024.0, total_size);
+++
+++    if (copy_ts) {
+++        if (copy_ts_first_pts == AV_NOPTS_VALUE && pts > 1)
+++            copy_ts_first_pts = pts;
+++        if (copy_ts_first_pts != AV_NOPTS_VALUE)
+++            pts -= copy_ts_first_pts;
+++    }
+++
+++    if (pts != AV_NOPTS_VALUE) {
+++        int     us    = FFABS64U(pts) % AV_TIME_BASE;
+++        int     secs  = FFABS64U(pts) / AV_TIME_BASE % 60;
+++        int     mins  = FFABS64U(pts) / AV_TIME_BASE / 60 % 60;
+++        int64_t hours = FFABS64U(pts) / AV_TIME_BASE / 3600;
+++
+++        av_bprintf(&buf, "\"time\":\"%s%" PRId64 "h%dm%d.%02ds\",",
+++                   pts < 0 ? "-" : "", hours, mins, secs, (100 * us) / AV_TIME_BASE);
+++    }
+++
+++    speed = pts != AV_NOPTS_VALUE && t != 0.0 ? (double)pts / AV_TIME_BASE / t : -1;
+++
+++    av_bprintf(&buf, "\"speed\":%.3g,", speed);
+++    av_bprintf(&buf, "\"dup\":%" PRIu64 ",\"drop\":%" PRIu64 "}", nb_frames_dup, nb_frames_drop);
+++
+++    json_print_line(&buf);
+++}
+++
+++static void print_report(int is_last_report, int64_t timer_start, int64_t cur_time, int64_t pts)
+++{
+++    if (print_jsonstats == 1) {
+++        print_json_report(is_last_report, timer_start, cur_time, pts);
+++        return;
+++    }
+++
+++    print_default_report(is_last_report, timer_start, cur_time, pts);
+++}
+++
++ static void print_stream_maps(void)
++ {
++     av_log(NULL, AV_LOG_INFO, "Stream mapping:\n");
++diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
++index c44aaf6..b15acc2 100644
++--- a/fftools/ffmpeg.h
+++++ b/fftools/ffmpeg.h
++@@ -458,6 +458,27 @@ typedef struct Decoder {
++     uint64_t         decode_errors;
++ } Decoder;
++ 
+++/**
+++ * Per-stream packet statistics for the JSON progress report (-jsonstats).
+++ * Written by the demuxer/muxer thread of the stream, read by the main thread
+++ * for reporting only.
+++ */
+++typedef struct JsonStats {
+++    uint64_t nb_packets;
+++    uint64_t nb_keyframes;
+++    // combined size of all the packets
+++    uint64_t data_size;
+++
+++    int      have_keyframe;
+++    int64_t  last_keyframe_dts;
+++    uint64_t last_keyframe_pktnb;
+++    uint64_t nsamples_average;
+++    double   min_framerate, max_framerate, avg_framerate;
+++    double   min_gopsize,   max_gopsize,   avg_gopsize;
+++} JsonStats;
+++
+++void jsonstats_update(JsonStats *js, const AVPacket *pkt, AVRational tb, int is_key);
+++
++ typedef struct InputStream {
++     const AVClass        *class;
++ 
++@@ -487,6 +508,8 @@ typedef struct InputStream {
++      * currently video and audio only */
++     InputFilter         **filters;
++     int                nb_filters;
+++
+++    JsonStats             jstats;
++ } InputStream;
++ 
++ typedef struct InputStreamGroup {
++@@ -668,6 +691,8 @@ typedef struct OutputStream {
++      * subtitles utilizing fix_sub_duration at random access points.
++      */
++     unsigned int fix_sub_duration_heartbeat;
+++
+++    JsonStats    jstats;
++ } OutputStream;
++ 
++ typedef struct OutputFile {
++@@ -744,6 +769,7 @@ extern int debug_ts;
++ extern int exit_on_error;
++ extern int abort_on_flags;
++ extern int print_stats;
+++extern int print_jsonstats;
++ extern int64_t stats_period;
++ extern int stdin_interaction;
++ extern AVIOContext *progress_avio;
++@@ -822,6 +848,8 @@ void fg_free(FilterGraph **pfg);
++ void fg_send_command(FilterGraph *fg, double time, const char *target,
++                      const char *command, const char *arg, int all_filters);
++ 
+++void print_json_inputs(void);
+++
++ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch);
++ 
++ void enc_stats_write(OutputStream *ost, EncStats *es,
++diff --git a/fftools/ffmpeg_demux.c b/fftools/ffmpeg_demux.c
++index 9d870bf..d2669ee 100644
++--- a/fftools/ffmpeg_demux.c
+++++ b/fftools/ffmpeg_demux.c
++@@ -493,6 +493,10 @@ static int input_packet_process(Demuxer *d, AVPacket *pkt, unsigned *send_flags)
++     ds->data_size += pkt->size;
++     ds->nb_packets++;
++ 
+++    jsonstats_update(&ist->jstats, pkt, ist->st->time_base,
+++                     (pkt->flags & AV_PKT_FLAG_KEY) ||
+++                     ist->par->codec_id == AV_CODEC_ID_WRAPPED_AVFRAME);
+++
++     fd->wallclock[LATENCY_PROBE_DEMUX] = av_gettime_relative();
++ 
++     if (debug_ts) {
++diff --git a/fftools/ffmpeg_mux.c b/fftools/ffmpeg_mux.c
++index b408b02..3d7e462 100644
++--- a/fftools/ffmpeg_mux.c
+++++ b/fftools/ffmpeg_mux.c
++@@ -223,6 +223,9 @@ static int write_packet(Muxer *mux, OutputStream *ost, AVPacket *pkt)
++     ms->data_size_mux += pkt->size;
++     frame_num = atomic_fetch_add(&ost->packets_written, 1);
++ 
+++    jsonstats_update(&ost->jstats, pkt, ost->st->time_base,
+++                     pkt->flags & AV_PKT_FLAG_KEY);
+++
++     pkt->stream_index = ost->index;
++ 
++     if (ms->stats.io)
++diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
++index 2c362c6..bd8964f 100644
++--- a/fftools/ffmpeg_opt.c
+++++ b/fftools/ffmpeg_opt.c
++@@ -68,6 +68,7 @@ int debug_ts          = 0;
++ int exit_on_error     = 0;
++ int abort_on_flags    = 0;
++ int print_stats       = -1;
+++int print_jsonstats   = 1;
++ int stdin_interaction = 1;
++ float max_error_rate  = 2.0/3;
++ char *filter_nbthreads;
++@@ -1463,6 +1464,8 @@ int ffmpeg_parse_options(int argc, char **argv, Scheduler *sch)
++         goto fail;
++     }
++ 
+++    print_json_inputs();
+++
++     /* open output files */
++     ret = open_files(&octx.groups[GROUP_OUTFILE], "output", sch, of_open);
++     if (ret < 0) {
++@@ -1776,6 +1779,9 @@ const OptionDef options[] = {
++     { "stats",               OPT_TYPE_BOOL, 0,
++         { &print_stats },
++         "print progress report during encoding", },
+++    { "jsonstats",           OPT_TYPE_BOOL, 0,
+++        { &print_jsonstats },
+++        "print JSON progress report during encoding", },
++     { "stats_period",        OPT_TYPE_FUNC, OPT_FUNC_ARG | OPT_EXPERT,
++         { .func_arg = opt_stats_period },
++         "set the period at which ffmpeg updates stats and -progress output", "time" },
++-- 
++2.43.0
++
+-- 
+2.43.0
+

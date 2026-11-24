@@ -1,0 +1,499 @@
+From c8e9472a82dafd13b75c8177ff1a2a0c16436415 Mon Sep 17 00:00:00 2001
+From: Corvid <corvid@example.invalid>
+Date: Fri, 20 Nov 2026 11:05:05 +0300
+Subject: [PATCH] Corvid v1.6: FFmpeg 9 support
+
+- ffmigrate: migrate stored processes to FFmpeg 7 and later (-vsync is
+  gone: the global one is dropped, a per output one becomes -fps_mode;
+  legacy NVENC presets and rate controls become p1..p7 plus a tuning).
+  The new options exist in FFmpeg 6 too, so a rollback keeps working.
+  A newer, unknown FFmpeg no longer stops the container.
+- skills: parse the -filters (two flags) and -formats (device flag)
+  listings of FFmpeg 7 and later; without it no filter and no format was
+  found.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ app/ffmigrate/main.go          |  23 +++-
+ app/ffmigrate/migrate7.go      | 212 +++++++++++++++++++++++++++++++++
+ app/ffmigrate/migrate7_test.go |  97 +++++++++++++++
+ ffmpeg/skills/skills.go        |  12 +-
+ ffmpeg/skills/skills_test.go   |  56 +++++++++
+ 5 files changed, 393 insertions(+), 7 deletions(-)
+ create mode 100644 app/ffmigrate/migrate7.go
+ create mode 100644 app/ffmigrate/migrate7_test.go
+
+diff --git a/app/ffmigrate/main.go b/app/ffmigrate/main.go
+index 5e95ae2..9e13388 100644
+--- a/app/ffmigrate/main.go
++++ b/app/ffmigrate/main.go
+@@ -160,6 +160,9 @@ func doMigration(logger log.Logger, fs fs.Filesystem, configstore cfgstore.Store
+ 	return nil
+ }
+ 
++// maxKnownMajor is the newest FFmpeg major version the migration knows.
++const maxKnownMajor = 9
++
+ func migrateProcessConfig(logger log.Logger, config *app.Config, version string) (bool, error) {
+ 	migrated := false
+ 
+@@ -188,10 +191,11 @@ func migrateProcessConfig(logger log.Logger, config *app.Config, version string)
+ 		return false, fmt.Errorf("unsupported FFmpeg version: %w", err)
+ 	}
+ 
+-	if targetmajor > 6 {
+-		err := fmt.Errorf("unknown FFmpeg version found: %d", targetmajor)
+-		logger.Error().WithError(err).Log("Unsupported FFmpeg version")
+-		return false, fmt.Errorf("unsupported FFmpeg version: %w", err)
++	if targetmajor > maxKnownMajor {
++		// Don't stop the container for a newer FFmpeg, the processes may
++		// still work. They are left untouched.
++		logger.Warn().WithField("version", version).Log("FFmpeg version is newer than the known ones, processes are not migrated")
++		return false, nil
+ 	}
+ 
+ 	if currentmajor != targetmajor {
+@@ -230,6 +234,17 @@ func migrateProcessConfig(logger log.Logger, config *app.Config, version string)
+ 		currentmajor = 6
+ 	}
+ 
++	if currentmajor <= 6 && targetmajor >= 7 {
++		// Migration from version 6 to version 7 and later:
++		// - "-vsync" becomes "-fps_mode"
++		// - legacy NVENC presets and rate controls become p1..p7 and a tuning
++		if migrateConfig7(config) {
++			migrated = true
++		}
++
++		currentmajor = targetmajor
++	}
++
+ 	if migrated {
+ 		logger.Info().WithFields(log.Fields{
+ 			"from": config.FFVersion,
+diff --git a/app/ffmigrate/migrate7.go b/app/ffmigrate/migrate7.go
+new file mode 100644
+index 0000000..fe93672
+--- /dev/null
++++ b/app/ffmigrate/migrate7.go
+@@ -0,0 +1,212 @@
++package main
++
++import (
++	"strings"
++
++	"github.com/datarhei/core/v16/restream/app"
++)
++
++// FFmpeg 7 rewrote the command line tool. Until FFmpeg 9 these options of
++// stored processes stopped working:
++//
++//   - "-vsync" is gone, "-fps_mode" (per output) replaces it.
++//   - The legacy NVENC presets (hp, hq, bd, ll, llhq, llhp, lossless, ...)
++//     and rate controls (cbr_ld_hq, cbr_hq, vbr_hq) are gone; p1..p7 plus
++//     a tuning info replace them.
++//
++// The new options exist in FFmpeg 6 as well, so a migrated process still
++// runs if the image is rolled back.
++
++var nvencLegacyPresets = map[string][2]string{
++	"default":    {"p4", ""},
++	"slow":       {"p7", "hq"},
++	"medium":     {"p4", "hq"},
++	"fast":       {"p2", "hq"},
++	"hp":         {"p1", "hq"},
++	"hq":         {"p6", "hq"},
++	"bd":         {"p7", "hq"},
++	"ll":         {"p4", "ll"},
++	"llhq":       {"p5", "ll"},
++	"llhp":       {"p2", "ll"},
++	"lossless":   {"p4", "lossless"},
++	"losslesshp": {"p1", "lossless"},
++	"losslesshq": {"p7", "lossless"},
++}
++
++var nvencLegacyRC = map[string][2]string{
++	"cbr_ld_hq": {"cbr", "ll"},
++	"cbr_hq":    {"cbr", ""},
++	"vbr_hq":    {"vbr", ""},
++}
++
++// vsyncToFPSMode maps a -vsync value to a -fps_mode value.
++func vsyncToFPSMode(v string) string {
++	switch v {
++	case "-1":
++		return "auto"
++	case "0":
++		return "passthrough"
++	case "1":
++		return "cfr"
++	case "2":
++		return "vfr"
++	}
++
++	return v
++}
++
++func optionName(o string) string {
++	if i := strings.IndexByte(o, ':'); i >= 0 {
++		return o[:i]
++	}
++
++	return o
++}
++
++// optionValue returns the value of the first option with one of the names
++// (stream specifiers are ignored) and whether it has been found.
++func optionValue(options []string, names ...string) (string, bool) {
++	for i := 0; i+1 < len(options); i++ {
++		name := optionName(options[i])
++		for _, n := range names {
++			if name == n {
++				return options[i+1], true
++			}
++		}
++	}
++
++	return "", false
++}
++
++func hasOption(options []string, names ...string) bool {
++	_, ok := optionValue(options, names...)
++	return ok
++}
++
++// removeOption removes all occurrences of an option with its value and
++// returns the new options and the last removed value.
++func removeOption(options []string, name string) ([]string, string, bool) {
++	result := make([]string, 0, len(options))
++	value := ""
++	found := false
++
++	for i := 0; i < len(options); i++ {
++		if optionName(options[i]) == name && i+1 < len(options) {
++			value = options[i+1]
++			found = true
++			i++
++			continue
++		}
++
++		result = append(result, options[i])
++	}
++
++	return result, value, found
++}
++
++// videoCodec returns the first video codec of the options (-codec:v, -c:v,
++// -codec:v:0, -vcodec, ...).
++func videoCodec(options []string) (string, bool) {
++	for i := 0; i+1 < len(options); i++ {
++		o := options[i]
++		if o == "-vcodec" {
++			return options[i+1], true
++		}
++
++		for _, prefix := range []string{"-codec:v", "-c:v"} {
++			if o == prefix || strings.HasPrefix(o, prefix+":") {
++				return options[i+1], true
++			}
++		}
++	}
++
++	return "", false
++}
++
++func usesNVENC(options []string) bool {
++	codec, _ := videoCodec(options)
++	return strings.HasSuffix(codec, "_nvenc")
++}
++
++// migrateOptions7 migrates the options of one output.
++func migrateOptions7(options []string) ([]string, bool) {
++	changed := false
++
++	// -vsync in the output options
++	for i := 0; i+1 < len(options); i++ {
++		if optionName(options[i]) != "-vsync" {
++			continue
++		}
++
++		options[i] = strings.Replace(options[i], "-vsync", "-fps_mode", 1)
++		options[i+1] = vsyncToFPSMode(options[i+1])
++		changed = true
++	}
++
++	if !usesNVENC(options) {
++		return options, changed
++	}
++
++	tune := ""
++
++	for i := 0; i+1 < len(options); i++ {
++		switch optionName(options[i]) {
++		case "-preset":
++			if m, ok := nvencLegacyPresets[options[i+1]]; ok {
++				options[i+1] = m[0]
++				if len(m[1]) != 0 {
++					tune = m[1]
++				}
++				changed = true
++			}
++		case "-rc":
++			if m, ok := nvencLegacyRC[options[i+1]]; ok {
++				options[i+1] = m[0]
++				if len(m[1]) != 0 {
++					tune = m[1]
++				}
++				changed = true
++			}
++		}
++	}
++
++	if len(tune) != 0 && !hasOption(options, "-tune") {
++		options = append(options, "-tune:v", tune)
++	}
++
++	return options, changed
++}
++
++// migrateConfig7 migrates a process config to FFmpeg 7 and later.
++func migrateConfig7(config *app.Config) bool {
++	changed := false
++
++	// The UI added a global "-vsync drop" for some audio encoders (mp3, opus,
++	// vorbis). It only ever affected encoded video and the UI doesn't add it
++	// for FFmpeg 7 and later, so it is dropped (fps_mode auto, the default).
++	options, _, found := removeOption(config.Options, "-vsync")
++	if found {
++		config.Options = options
++		changed = true
++	}
++
++	for i, output := range config.Output {
++		options, ok := migrateOptions7(output.Options)
++		if ok {
++			output.Options = options
++			config.Output[i] = output
++			changed = true
++		}
++	}
++
++	for i, input := range config.Input {
++		options, _, found := removeOption(input.Options, "-vsync")
++		if found {
++			input.Options = options
++			config.Input[i] = input
++			changed = true
++		}
++	}
++
++	return changed
++}
+diff --git a/app/ffmigrate/migrate7_test.go b/app/ffmigrate/migrate7_test.go
+new file mode 100644
+index 0000000..5d28b60
+--- /dev/null
++++ b/app/ffmigrate/migrate7_test.go
+@@ -0,0 +1,97 @@
++package main
++
++import (
++	"testing"
++
++	"github.com/datarhei/core/v16/log"
++	"github.com/datarhei/core/v16/restream/app"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestMigrate7GlobalVsync(t *testing.T) {
++	config := &app.Config{
++		FFVersion: "^6.1.0",
++		Options:   []string{"-loglevel", "level+info", "-vsync", "drop", "-err_detect", "ignore_err"},
++		Output: []app.ConfigIO{
++			{Options: []string{"-codec:v", "h264_nvenc", "-preset:v", "p4", "-codec:a", "libopus", "-f", "flv"}},
++			{Options: []string{"-codec:v", "copy", "-codec:a", "copy", "-f", "hls"}},
++		},
++	}
++
++	migrated, err := migrateProcessConfig(log.New(""), config, "9.0.2")
++	require.NoError(t, err)
++	require.True(t, migrated)
++
++	require.Equal(t, "^9.0.2", config.FFVersion)
++	require.Equal(t, []string{"-loglevel", "level+info", "-err_detect", "ignore_err"}, config.Options)
++	require.Equal(t, []string{"-codec:v", "h264_nvenc", "-preset:v", "p4", "-codec:a", "libopus", "-f", "flv"}, config.Output[0].Options)
++	require.Equal(t, []string{"-codec:v", "copy", "-codec:a", "copy", "-f", "hls"}, config.Output[1].Options)
++}
++
++func TestMigrate7OutputVsync(t *testing.T) {
++	config := &app.Config{
++		FFVersion: "^6.1.0",
++		Output: []app.ConfigIO{
++			{Options: []string{"-codec:v", "libx264", "-vsync", "1", "-f", "flv"}},
++			{Options: []string{"-codec:v", "libx264", "-vsync:v", "0", "-f", "flv"}},
++		},
++	}
++
++	_, err := migrateProcessConfig(log.New(""), config, "9.0.2")
++	require.NoError(t, err)
++
++	require.Equal(t, []string{"-codec:v", "libx264", "-fps_mode", "cfr", "-f", "flv"}, config.Output[0].Options)
++	require.Equal(t, []string{"-codec:v", "libx264", "-fps_mode:v", "passthrough", "-f", "flv"}, config.Output[1].Options)
++}
++
++func TestMigrate7NVENCLegacy(t *testing.T) {
++	config := &app.Config{
++		FFVersion: "^6.1.0",
++		Output: []app.ConfigIO{
++			{Options: []string{"-codec:v", "h264_nvenc", "-preset:v", "llhq", "-rc:v", "cbr_ld_hq", "-f", "flv"}},
++			{Options: []string{"-codec:v", "hevc_nvenc", "-preset", "hq", "-tune:v", "ull", "-rc", "vbr_hq"}},
++			{Options: []string{"-codec:v", "libx264", "-preset:v", "fast"}},
++		},
++	}
++
++	_, err := migrateProcessConfig(log.New(""), config, "9.0.2")
++	require.NoError(t, err)
++
++	require.Equal(t, []string{"-codec:v", "h264_nvenc", "-preset:v", "p5", "-rc:v", "cbr", "-f", "flv", "-tune:v", "ll"}, config.Output[0].Options)
++	// an explicit tuning is kept
++	require.Equal(t, []string{"-codec:v", "hevc_nvenc", "-preset", "p6", "-tune:v", "ull", "-rc", "vbr"}, config.Output[1].Options)
++	// not NVENC, untouched
++	require.Equal(t, []string{"-codec:v", "libx264", "-preset:v", "fast"}, config.Output[2].Options)
++}
++
++func TestMigrate7Unchanged(t *testing.T) {
++	options := []string{"-codec:v", "h264_nvenc", "-preset:v", "p4", "-tune:v", "ll", "-fps_mode", "cfr"}
++	config := &app.Config{
++		FFVersion: "^9.0.0",
++		Output:    []app.ConfigIO{{Options: append([]string{}, options...)}},
++	}
++
++	migrated, err := migrateProcessConfig(log.New(""), config, "9.0.2")
++	require.NoError(t, err)
++	require.False(t, migrated)
++	require.Equal(t, options, config.Output[0].Options)
++}
++
++func TestMigrateNewerMajorDoesNotFail(t *testing.T) {
++	config := &app.Config{FFVersion: "^6.1.0", Options: []string{"-vsync", "drop"}}
++
++	migrated, err := migrateProcessConfig(log.New(""), config, "12.0.0")
++	require.NoError(t, err)
++	require.False(t, migrated)
++	require.Equal(t, []string{"-vsync", "drop"}, config.Options)
++}
++
++func TestMigrateRollbackTo6(t *testing.T) {
++	config := &app.Config{FFVersion: "^9.0.2", Output: []app.ConfigIO{{Options: []string{"-fps_mode", "drop"}}}}
++
++	_, err := migrateProcessConfig(log.New(""), config, "6.1.1")
++	require.NoError(t, err)
++	require.Equal(t, "^6.1.1", config.FFVersion)
++	require.Equal(t, []string{"-fps_mode", "drop"}, config.Output[0].Options)
++}
+diff --git a/ffmpeg/skills/skills.go b/ffmpeg/skills/skills.go
+index 8f9d103..17bf8f8 100644
+--- a/ffmpeg/skills/skills.go
++++ b/ffmpeg/skills/skills.go
+@@ -193,7 +193,9 @@ func filters(binary string) []Filter {
+ func parseFilters(data []byte) []Filter {
+ 	filters := []Filter{}
+ 
+-	re := regexp.MustCompile(`^\s[TSC.]{3} ([0-9A-Za-z_]+)\s+(?:.*?)\s+(.*)?$`)
++	// FFmpeg <= 6: " T.C name  A->A  description" (timeline, slice threading, command)
++	// FFmpeg >= 7: " TS name  A->A  description" (the command flag is gone)
++	re := regexp.MustCompile(`^\s[TSC.]{2,3} ([0-9A-Za-z_]+)\s+(?:.*?)\s+(.*)?$`)
+ 
+ 	scanner := bufio.NewScanner(bytes.NewReader(data))
+ 	scanner.Split(bufio.ScanLines)
+@@ -286,7 +288,9 @@ func formats(binary string) ffFormats {
+ func parseFormats(data []byte) ffFormats {
+ 	formats := ffFormats{}
+ 
+-	re := regexp.MustCompile(`^\s([D ])([E ]) ([0-9A-Za-z_,]+)\s+(.*?)$`)
++	// FFmpeg <= 6: " DE name  description"
++	// FFmpeg >= 7: " DEd name  description" (d = is a device)
++	re := regexp.MustCompile(`^\s([D ])([E ])[d ]? ([0-9A-Za-z_,]+)\s+(.*?)$`)
+ 
+ 	scanner := bufio.NewScanner(bytes.NewReader(data))
+ 	scanner.Split(bufio.ScanLines)
+@@ -330,7 +334,9 @@ func devices(binary string) ffDevices {
+ func parseDevices(data []byte, binary string) ffDevices {
+ 	devices := ffDevices{}
+ 
+-	re := regexp.MustCompile(`^\s([D ])([E ]) ([0-9A-Za-z_,]+)\s+(.*?)$`)
++	// FFmpeg <= 6: " DE name  description"
++	// FFmpeg >= 7: " DEd name  description" (d = is a device)
++	re := regexp.MustCompile(`^\s([D ])([E ])[d ]? ([0-9A-Za-z_,]+)\s+(.*?)$`)
+ 
+ 	scanner := bufio.NewScanner(bytes.NewReader(data))
+ 	scanner.Split(bufio.ScanLines)
+diff --git a/ffmpeg/skills/skills_test.go b/ffmpeg/skills/skills_test.go
+index bc992a2..538bf63 100644
+--- a/ffmpeg/skills/skills_test.go
++++ b/ffmpeg/skills/skills_test.go
+@@ -457,3 +457,59 @@ videotoolbox`
+ 		},
+ 	}, p)
+ }
++
++// FFmpeg 7 and later print two filter flags (no command flag) and a third
++// format flag ("d", is a device).
++func TestFilters7(t *testing.T) {
++	data := `Filters:
++  T.. = Timeline support
++  .S. = Slice threading
++  A = Audio input/output
++  V = Video input/output
++  N = Dynamic number and/or type of input/output
++  | = Source or sink filter
++  ------
++ .. aresample         A->A       Resample audio data.
++ TS overlay           VV->V      Overlay a video source on top of the input.
++ .S scale             V->V       Scale the input video size and/or convert the image format.
++ .. sine              |->A       Generate sine wave audio signal.`
++
++	f := parseFilters([]byte(data))
++
++	require.Equal(t, []Filter{
++		{Id: "aresample", Name: "Resample audio data."},
++		{Id: "overlay", Name: "Overlay a video source on top of the input."},
++		{Id: "scale", Name: "Scale the input video size and/or convert the image format."},
++		{Id: "sine", Name: "Generate sine wave audio signal."},
++	}, f)
++}
++
++func TestFormats7(t *testing.T) {
++	data := `Formats:
++ D.. = Demuxing supported
++ .E. = Muxing supported
++ ..d = Is a device
++ ---
++ DE  flv             FLV (Flash Video)
++  E  hls             Apple HTTP Live Streaming
++ D d lavfi           Libavfilter virtual input device
++ DE  mpegts          MPEG-TS (MPEG-2 Transport Stream)
++ DEd v4l2,video4linux2 Video4Linux2 output device`
++
++	f := parseFormats([]byte(data))
++
++	require.Equal(t, ffFormats{
++		Demuxers: []Format{
++			{Id: "flv", Name: "FLV (Flash Video)"},
++			{Id: "lavfi", Name: "Libavfilter virtual input device"},
++			{Id: "mpegts", Name: "MPEG-TS (MPEG-2 Transport Stream)"},
++			{Id: "v4l2", Name: "Video4Linux2 output device"},
++		},
++		Muxers: []Format{
++			{Id: "flv", Name: "FLV (Flash Video)"},
++			{Id: "hls", Name: "Apple HTTP Live Streaming"},
++			{Id: "mpegts", Name: "MPEG-TS (MPEG-2 Transport Stream)"},
++			{Id: "v4l2", Name: "Video4Linux2 output device"},
++		},
++	}, f)
++}
+-- 
+2.43.0
+

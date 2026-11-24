@@ -1,0 +1,343 @@
+From fd83271e217d87f45720b4842e7451d2f7ea3d83 Mon Sep 17 00:00:00 2001
+From: Corvid <corvid@example.invalid>
+Date: Fri, 20 Nov 2026 11:24:27 +0300
+Subject: [PATCH] Corvid v1.6: FFmpeg 9
+
+- Accept FFmpeg 7, 8 and 9 (compatibility check and every source).
+- The mp3, opus, vorbis and AudioToolbox AAC encoders no longer add the
+  global "-vsync drop" for FFmpeg 7 and later (the option is gone there,
+  the process would not start). FFmpeg 6 gets the same command as before.
+- opus: the delay option was passed without its dash.
+- Version 1.6.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ .../coders/Encoders/audio/aac_audiotoolbox.js |  2 +-
+ .../coders/Encoders/audio/mp3_libmp3lame.js   |  2 +-
+ src/misc/coders/Encoders/audio/opus.js        |  4 +--
+ src/misc/coders/Encoders/audio/vorbis.js      |  2 +-
+ .../coders/Encoders/audio/vorbis_libvorbis.js |  2 +-
+ src/misc/coders/Encoders/audio/vsync.test.js  | 29 +++++++++++++++++++
+ src/misc/coders/helper/index.js               | 12 ++++++++
+ src/version.js                                |  4 +--
+ src/views/Edit/Sources/ALSA.js                |  2 +-
+ src/views/Edit/Sources/AVFoundation.js        |  2 +-
+ src/views/Edit/Sources/AudioLoop.js           |  2 +-
+ src/views/Edit/Sources/Framebuffer.js         |  2 +-
+ src/views/Edit/Sources/Network.js             |  2 +-
+ src/views/Edit/Sources/NoAudio.js             |  2 +-
+ src/views/Edit/Sources/Raspicam.js            |  2 +-
+ src/views/Edit/Sources/V4L.js                 |  2 +-
+ src/views/Edit/Sources/VideoAudio.js          |  2 +-
+ src/views/Edit/Sources/VideoLoop.js           |  2 +-
+ src/views/Edit/Sources/VirtualAudio.js        |  2 +-
+ src/views/Edit/Sources/VirtualVideo.js        |  2 +-
+ 20 files changed, 61 insertions(+), 20 deletions(-)
+ create mode 100644 src/misc/coders/Encoders/audio/vsync.test.js
+
+diff --git a/src/misc/coders/Encoders/audio/aac_audiotoolbox.js b/src/misc/coders/Encoders/audio/aac_audiotoolbox.js
+index 469e354..4361e96 100644
+--- a/src/misc/coders/Encoders/audio/aac_audiotoolbox.js
++++ b/src/misc/coders/Encoders/audio/aac_audiotoolbox.js
+@@ -25,7 +25,7 @@ function createMapping(settings, stream, skills) {
+ 	}
+ 
+ 	const mapping = {
+-		global: [['-vsync', 'drop']],
++		global: Helper.AudioGlobals(skills),
+ 		local: local,
+ 		filter: [],
+ 	};
+diff --git a/src/misc/coders/Encoders/audio/mp3_libmp3lame.js b/src/misc/coders/Encoders/audio/mp3_libmp3lame.js
+index f784e77..ecafe21 100644
+--- a/src/misc/coders/Encoders/audio/mp3_libmp3lame.js
++++ b/src/misc/coders/Encoders/audio/mp3_libmp3lame.js
+@@ -22,7 +22,7 @@ function createMapping(settings, stream, skills) {
+ 	const local = ['-codec:a', 'libmp3lame', '-b:a', `${settings.bitrate}k`, '-shortest'];
+ 
+ 	const mapping = {
+-		global: [['-vsync', 'drop']],
++		global: Helper.AudioGlobals(skills),
+ 		local: local,
+ 		filter: [],
+ 	};
+diff --git a/src/misc/coders/Encoders/audio/opus.js b/src/misc/coders/Encoders/audio/opus.js
+index e46c5c6..574b03f 100644
+--- a/src/misc/coders/Encoders/audio/opus.js
++++ b/src/misc/coders/Encoders/audio/opus.js
+@@ -38,11 +38,11 @@ function createMapping(settings, stream, skills) {
+ 	const local = ['-codec:a', 'opus', '-b:a', `${settings.bitrate}k`, '-vbr', 'on', '-shortest'];
+ 
+ 	if (settings.delay !== 'auto') {
+-		local.push('opus_delay', settings.delay);
++		local.push('-opus_delay', settings.delay);
+ 	}
+ 
+ 	const mapping = {
+-		global: [['-vsync', 'drop']],
++		global: Helper.AudioGlobals(skills),
+ 		local: local,
+ 		filter: [],
+ 	};
+diff --git a/src/misc/coders/Encoders/audio/vorbis.js b/src/misc/coders/Encoders/audio/vorbis.js
+index f5db446..4312b80 100644
+--- a/src/misc/coders/Encoders/audio/vorbis.js
++++ b/src/misc/coders/Encoders/audio/vorbis.js
+@@ -21,7 +21,7 @@ function createMapping(settings, stream, skills) {
+ 	const local = ['-codec:a', 'vorbis', '-b:a', `${settings.bitrate}k`, '-qscale:a', '3', '-shortest'];
+ 
+ 	const mapping = {
+-		global: [['-vsync', 'drop']],
++		global: Helper.AudioGlobals(skills),
+ 		local: local,
+ 		filter: [],
+ 	};
+diff --git a/src/misc/coders/Encoders/audio/vorbis_libvorbis.js b/src/misc/coders/Encoders/audio/vorbis_libvorbis.js
+index 7a573c1..1ed6604 100644
+--- a/src/misc/coders/Encoders/audio/vorbis_libvorbis.js
++++ b/src/misc/coders/Encoders/audio/vorbis_libvorbis.js
+@@ -21,7 +21,7 @@ function createMapping(settings, stream, skills) {
+ 	const local = ['-codec:a', 'libvorbis', '-b:a', `${settings.bitrate}k`, '-shortest'];
+ 
+ 	const mapping = {
+-		global: [['-vsync', 'drop']],
++		global: Helper.AudioGlobals(skills),
+ 		local: local,
+ 		filter: [],
+ 	};
+diff --git a/src/misc/coders/Encoders/audio/vsync.test.js b/src/misc/coders/Encoders/audio/vsync.test.js
+new file mode 100644
+index 0000000..e0467bb
+--- /dev/null
++++ b/src/misc/coders/Encoders/audio/vsync.test.js
+@@ -0,0 +1,29 @@
++import * as Opus from './opus';
++import * as Mp3 from './mp3_libmp3lame';
++import * as Vorbis from './vorbis_libvorbis';
++
++const skills = (version) => {
++	const [major, minor] = version.split('.').map((x) => parseInt(x));
++	return { ffmpeg: { version, version_major: major, version_minor: minor } };
++};
++
++const stream = { codec: 'aac', sampling_hz: 48000, layout: 'stereo', channels: 2 };
++
++// "-vsync" is gone since FFmpeg 7: an encoder must not add it there, but keeps adding it
++// for FFmpeg 6 (unchanged behavior).
++describe.each([
++	['opus', Opus],
++	['mp3', Mp3],
++	['vorbis', Vorbis],
++])('%s', (name, coder) => {
++	test('FFmpeg 6 keeps -vsync drop', () => {
++		const settings = coder.defaults(stream, skills('6.1.1'));
++		expect(settings.mapping.global).toEqual([['-vsync', 'drop']]);
++	});
++
++	test('FFmpeg 9 adds no -vsync', () => {
++		const settings = coder.defaults(stream, skills('9.0.2'));
++		expect(settings.mapping.global).toEqual([]);
++		expect(settings.mapping.local).not.toContain('-vsync');
++	});
++});
+diff --git a/src/misc/coders/helper/index.js b/src/misc/coders/helper/index.js
+index 9bf5c1b..aba8172 100644
+--- a/src/misc/coders/helper/index.js
++++ b/src/misc/coders/helper/index.js
+@@ -31,7 +31,19 @@ function InitSkills(initialSkills) {
+ 	return skills;
+ }
+ 
++// Global options that some audio encoders add. "-vsync" is gone since
++// FFmpeg 7 (replaced by the per output "-fps_mode"); it only ever affected
++// encoded video, so nothing is added there.
++function AudioGlobals(skills) {
++	if (skills.ffmpeg.version_major >= 7) {
++		return [];
++	}
++
++	return [['-vsync', 'drop']];
++}
++
+ export default {
+ 	InitStream,
+ 	InitSkills,
++	AudioGlobals,
+ };
+diff --git a/src/version.js b/src/version.js
+index 25f102c..2e65dab 100644
+--- a/src/version.js
++++ b/src/version.js
+@@ -1,10 +1,10 @@
+ import pkg from '../package.json';
+ 
+ const Core = '^16.11.0';
+-const FFmpeg = '^5.1.0 || ^6.1.0';
++const FFmpeg = '^5.1.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ const UI = pkg.bundle ? pkg.bundle : pkg.name + ' v' + pkg.version;
+ const Version = pkg.version;
+ // Corvid's version (fork), see BENIOKU.txt.
+-const Release = '1.5';
++const Release = '1.6';
+ 
+ export { Core, FFmpeg, UI, Version, Release };
+diff --git a/src/views/Edit/Sources/ALSA.js b/src/views/Edit/Sources/ALSA.js
+index 1d562db..4b2dd41 100644
+--- a/src/views/Edit/Sources/ALSA.js
++++ b/src/views/Edit/Sources/ALSA.js
+@@ -155,7 +155,7 @@ function SourceIcon(props) {
+ const id = 'alsa';
+ const name = <Trans>ALSA</Trans>;
+ const capabilities = ['audio'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/AVFoundation.js b/src/views/Edit/Sources/AVFoundation.js
+index 072b7d9..5d860bf 100644
+--- a/src/views/Edit/Sources/AVFoundation.js
++++ b/src/views/Edit/Sources/AVFoundation.js
+@@ -220,7 +220,7 @@ function SourceIcon(props) {
+ const id = 'avfoundation';
+ const name = <Trans>AVFoundation</Trans>;
+ const capabilities = ['audio', 'video'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/AudioLoop.js b/src/views/Edit/Sources/AudioLoop.js
+index 2220f50..e513753 100644
+--- a/src/views/Edit/Sources/AudioLoop.js
++++ b/src/views/Edit/Sources/AudioLoop.js
+@@ -193,7 +193,7 @@ function SourceIcon(props) {
+ const id = 'audioloop';
+ const name = <Trans>Loop</Trans>;
+ const capabilities = ['audio'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/Framebuffer.js b/src/views/Edit/Sources/Framebuffer.js
+index 2f80556..662f6e3 100644
+--- a/src/views/Edit/Sources/Framebuffer.js
++++ b/src/views/Edit/Sources/Framebuffer.js
+@@ -128,7 +128,7 @@ function SourceIcon(props) {
+ const id = 'fbdev';
+ const name = <Trans>Framebuffer</Trans>;
+ const capabilities = ['video'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/Network.js b/src/views/Edit/Sources/Network.js
+index 067183a..bcd692b 100644
+--- a/src/views/Edit/Sources/Network.js
++++ b/src/views/Edit/Sources/Network.js
+@@ -1187,7 +1187,7 @@ function SourceIcon(props) {
+ const id = 'network';
+ const name = <Trans>Network source</Trans>;
+ const capabilities = ['audio', 'video'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/NoAudio.js b/src/views/Edit/Sources/NoAudio.js
+index b6f7668..c750042 100644
+--- a/src/views/Edit/Sources/NoAudio.js
++++ b/src/views/Edit/Sources/NoAudio.js
+@@ -44,7 +44,7 @@ function SourceIcon(props) {
+ const id = 'noaudio';
+ const name = <Trans>No audio</Trans>;
+ const capabilities = ['audio'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/Raspicam.js b/src/views/Edit/Sources/Raspicam.js
+index 471704f..56c66b7 100644
+--- a/src/views/Edit/Sources/Raspicam.js
++++ b/src/views/Edit/Sources/Raspicam.js
+@@ -143,7 +143,7 @@ function SourceIcon(props) {
+ const id = 'raspicam';
+ const name = <Trans>Raspberry Pi camera</Trans>;
+ const capabilities = ['video'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/V4L.js b/src/views/Edit/Sources/V4L.js
+index 003c166..7f86131 100644
+--- a/src/views/Edit/Sources/V4L.js
++++ b/src/views/Edit/Sources/V4L.js
+@@ -153,7 +153,7 @@ function SourceIcon(props) {
+ const id = 'video4linux2';
+ const name = <Trans>Hardware device</Trans>;
+ const capabilities = ['video'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/VideoAudio.js b/src/views/Edit/Sources/VideoAudio.js
+index 47b3ec0..92bbffb 100644
+--- a/src/views/Edit/Sources/VideoAudio.js
++++ b/src/views/Edit/Sources/VideoAudio.js
+@@ -44,7 +44,7 @@ function SourceIcon(props) {
+ const id = 'videoaudio';
+ const name = <Trans>Video source</Trans>;
+ const capabilities = ['audio'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/VideoLoop.js b/src/views/Edit/Sources/VideoLoop.js
+index 9350f33..bab382d 100644
+--- a/src/views/Edit/Sources/VideoLoop.js
++++ b/src/views/Edit/Sources/VideoLoop.js
+@@ -201,7 +201,7 @@ function SourceIcon(props) {
+ const id = 'videoloop';
+ const name = <Trans>Loop</Trans>;
+ const capabilities = ['video'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/VirtualAudio.js b/src/views/Edit/Sources/VirtualAudio.js
+index de0b0d5..388cfd8 100644
+--- a/src/views/Edit/Sources/VirtualAudio.js
++++ b/src/views/Edit/Sources/VirtualAudio.js
+@@ -186,7 +186,7 @@ function SourceIcon(props) {
+ const id = 'virtualaudio';
+ const name = <Trans>Virtual source</Trans>;
+ const capabilities = ['audio'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+diff --git a/src/views/Edit/Sources/VirtualVideo.js b/src/views/Edit/Sources/VirtualVideo.js
+index aeb8dfa..97dc82d 100644
+--- a/src/views/Edit/Sources/VirtualVideo.js
++++ b/src/views/Edit/Sources/VirtualVideo.js
+@@ -205,7 +205,7 @@ function SourceIcon(props) {
+ const id = 'virtualvideo';
+ const name = <Trans>Virtual source</Trans>;
+ const capabilities = ['video'];
+-const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0';
++const ffversion = '^4.1.0 || ^5.0.0 || ^6.1.0 || ^7.0.0 || ^8.0.0 || ^9.0.0';
+ 
+ const func = {
+ 	initSettings,
+-- 
+2.43.0
+

@@ -1,0 +1,657 @@
+From 675bd4e8cf23accbc46281380bd510f2e96c08df Mon Sep 17 00:00:00 2001
+From: Corvid <corvid@example.invalid>
+Date: Mon, 23 Nov 2026 09:46:53 +0300
+Subject: [PATCH] Corvid v1.7: failover stall times in the panel, RTMP ack fix
+
+- The silence after which a fallback (the backup) is left for the next
+  one (the waiting picture) is a setting of its own (FallbackStall,
+  default: the primary's Stall). A flaky backup line stays on air through
+  short gaps instead of flipping to the waiting picture.
+- Both stall times change at run time, also for connected players:
+  GET/PUT /api/v3/fork/failover (PUT admin only), stored in
+  <db>/failover.json and applied at start over the CORE_RTMP_FAILOVER_*
+  defaults.
+- joy4 (vendored): the RTMP Acknowledgement carried the bytes since the
+  last acknowledgement instead of the sequence number (total bytes
+  received, RTMP spec 5.4.3). Clients with flow control could stall.
+  Note: keep this change when re-vendoring.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ app/api/api.go                                |   9 ++
+ http/handler/api/failover.go                  |  36 +++++
+ http/roles.go                                 |   1 +
+ http/server.go                                |  16 +++
+ rtmp/failover.go                              |  31 ++++-
+ rtmp/failover_test.go                         | 102 ++++++++++++++
+ rtmp/rtmp.go                                  |  32 ++++-
+ rtmp/settings.go                              | 124 ++++++++++++++++++
+ rtmp/settings_test.go                         |  60 +++++++++
+ .../datarhei/joy4/format/rtmp/rtmp.go         |   6 +-
+ 10 files changed, 410 insertions(+), 7 deletions(-)
+ create mode 100644 http/handler/api/failover.go
+ create mode 100644 rtmp/settings.go
+ create mode 100644 rtmp/settings_test.go
+
+diff --git a/app/api/api.go b/app/api/api.go
+index 2da3b9b..84c0f83 100644
+--- a/app/api/api.go
++++ b/app/api/api.go
+@@ -81,6 +81,7 @@ type api struct {
+ 	memfs         fs.Filesystem
+ 	s3fs          map[string]fs.Filesystem
+ 	rtmpserver    rtmp.Server
++	failover      *rtmp.SettingsStore
+ 	srtserver     srt.Server
+ 	metrics       monitor.HistoryMonitor
+ 	prom          prometheus.Metrics
+@@ -981,6 +982,12 @@ func (a *api) start() error {
+ 		}
+ 
+ 		a.rtmpserver = rtmpserver
++
++		// Stall times changed in the panel win over the CORE_RTMP_FAILOVER_* defaults (fork).
++		a.failover = rtmp.NewSettingsStore(filepath.Join(cfg.DB.Dir, "failover.json"), rtmpserver)
++		if err := a.failover.Apply(); err != nil {
++			a.log.logger.rtmp.Warn().WithError(err).Log("Ignoring the stored failover settings")
++		}
+ 	}
+ 
+ 	if cfg.SRT.Enable {
+@@ -1105,6 +1112,7 @@ func (a *api) start() error {
+ 		ReadOnly:     cfg.API.ReadOnly,
+ 		Users:        accounts,
+ 		CPU:          a.cpu,
++		Failover:     a.failover,
+ 		TicketSecret: cfg.API.Auth.JWT.Secret,
+ 	}
+ 
+@@ -1451,6 +1459,7 @@ func (a *api) stop() {
+ 
+ 		a.rtmpserver.Close()
+ 		a.rtmpserver = nil
++		a.failover = nil
+ 	}
+ 
+ 	// Shutdown the HTTP/S mainserver
+diff --git a/http/handler/api/failover.go b/http/handler/api/failover.go
+new file mode 100644
+index 0000000..929df56
+--- /dev/null
++++ b/http/handler/api/failover.go
+@@ -0,0 +1,36 @@
++package api
++
++import (
++	"net/http"
++
++	"github.com/datarhei/core/v16/http/api"
++	"github.com/datarhei/core/v16/http/handler/util"
++	"github.com/datarhei/core/v16/rtmp"
++
++	"github.com/labstack/echo/v4"
++)
++
++// FailoverHandler reads and sets the stall times of the RTMP failover (fork).
++type FailoverHandler struct {
++	store *rtmp.SettingsStore
++}
++
++func NewFailover(store *rtmp.SettingsStore) *FailoverHandler {
++	return &FailoverHandler{store: store}
++}
++
++func (h *FailoverHandler) Get(c echo.Context) error {
++	return c.JSON(http.StatusOK, h.store.State())
++}
++
++func (h *FailoverHandler) Set(c echo.Context) error {
++	var req rtmp.FailoverSettings
++	if err := util.ShouldBindJSON(c, &req); err != nil {
++		return api.Err(http.StatusBadRequest, "", "Invalid JSON: %s", err.Error())
++	}
++	st, err := h.store.Set(req)
++	if err != nil {
++		return api.Err(http.StatusBadRequest, "", "%s", err.Error())
++	}
++	return c.JSON(http.StatusOK, st)
++}
+diff --git a/http/roles.go b/http/roles.go
+index 160d8b1..0422e30 100644
+--- a/http/roles.go
++++ b/http/roles.go
+@@ -28,6 +28,7 @@ var adminOnly = map[string]bool{
+ 	"POST /api/v3/fork/seal":          true,
+ 	"POST /api/v3/fork/unseal":        true,
+ 	"PUT /api/v3/fork/cpu":            true,
++	"PUT /api/v3/fork/failover":       true,
+ }
+ 
+ // viewerDenied are reading routes that change something nevertheless.
+diff --git a/http/server.go b/http/server.go
+index 15af37a..f8f47e4 100644
+--- a/http/server.go
++++ b/http/server.go
+@@ -104,6 +104,9 @@ type Config struct {
+ 	TicketSecret string
+ 	// CPU sets the host's CPU frequency governor (fork); nil leaves it out.
+ 	CPU *cpufreq.Manager
++
++	// Failover settings of the RTMP server (fork), nil if RTMP is off.
++	Failover *rtmp.SettingsStore
+ }
+ 
+ type CorsConfig struct {
+@@ -143,6 +146,7 @@ type server struct {
+ 		resources *api.MetricsHandler
+ 		users     *api.UsersHandler
+ 		cpu       *api.CPUHandler
++		failover  *api.FailoverHandler
+ 	}
+ 
+ 	middleware struct {
+@@ -294,6 +298,10 @@ func NewServer(config Config) (Server, error) {
+ 		s.v3handler.cpu = api.NewCPU(config.CPU)
+ 	}
+ 
++	if config.Failover != nil {
++		s.v3handler.failover = api.NewFailover(config.Failover)
++	}
++
+ 	if config.SRT != nil {
+ 		s.v3handler.srt = api.NewSRT(
+ 			config.SRT,
+@@ -747,4 +755,12 @@ func (s *server) setRoutesV3(v3 *echo.Group) {
+ 			v3.PUT("/fork/cpu", s.v3handler.cpu.Set)
+ 		}
+ 	}
++
++	// v3 RTMP failover: when viewers move to the backup and to the waiting picture (fork)
++	if s.v3handler.failover != nil {
++		v3.GET("/fork/failover", s.v3handler.failover.Get)
++		if !s.readOnly {
++			v3.PUT("/fork/failover", s.v3handler.failover.Set)
++		}
++	}
+ }
+diff --git a/rtmp/failover.go b/rtmp/failover.go
+index 7679a4a..c955335 100644
+--- a/rtmp/failover.go
++++ b/rtmp/failover.go
+@@ -48,12 +48,24 @@ type FailoverConfig struct {
+ 	// ingest FFmpeg keeps running (blocked on its input) and never disconnects from the
+ 	// RTMP server. 0 disables the detection (only disconnects trigger the switch).
+ 	Stall time.Duration
++	// FallbackStall: a fallback (e.g. the backup stream) that stays connected but delivers
++	// nothing for this long is passed over for the next one (e.g. the waiting picture).
++	// 0 = the same as Stall. A longer time keeps a flaky backup on air through short gaps.
++	FallbackStall time.Duration
+ }
+ 
+ func DefaultFailoverConfig() FailoverConfig {
+ 	return FailoverConfig{Enable: true, Grace: 10 * time.Second, RecoverAfter: 3 * time.Second, Stall: 3 * time.Second}
+ }
+ 
++// stallFor returns the silence after which the source on path counts as lost.
++func (c FailoverConfig) stallFor(fallback bool) time.Duration {
++	if fallback && c.FallbackStall > 0 {
++		return c.FallbackStall
++	}
++	return c.Stall
++}
++
+ // HandoverAfter is how long a "_next" stream must deliver at real time before players move
+ // to it. Shorter than RecoverAfter: it is a process we started on purpose, not a flapping one.
+ const HandoverAfter = time.Second
+@@ -209,6 +221,15 @@ func (s *server) lookup(path string) *channel {
+ 	return s.channels[path]
+ }
+ 
++// conf returns the configuration; the stall times follow changes made at run time (panel).
++func (d *failoverDemuxer) conf() FailoverConfig {
++	c := d.cfg
++	if d.s != nil {
++		c.Stall, c.FallbackStall = d.s.FailoverStall()
++	}
++	return c
++}
++
+ // open subscribes to a channel at its live edge.
+ func (d *failoverDemuxer) open(path string) *source {
+ 	ch := d.s.lookup(path)
+@@ -536,15 +557,17 @@ func (d *failoverDemuxer) checkStall() {
+ 	}
+ 	d.dropSilentPending()
+ 	idle := d.cur.idle()
++	cfg := d.conf()
+ 	if d.pendingBusy() {
+ 		// The primary came back before the fallback's keyframe arrived: stay.
+-		if d.isMain(d.cur.path) && !d.isMain(d.pending.path) && d.cfg.Stall > 0 && idle < d.cfg.Stall/2 {
++		if d.isMain(d.cur.path) && !d.isMain(d.pending.path) && cfg.Stall > 0 && idle < cfg.Stall/2 {
+ 			d.pending.stop()
+ 			d.pending = nil
+ 		}
+ 		return
+ 	}
+-	if d.cfg.Stall <= 0 || idle < d.cfg.Stall {
++	stall := cfg.stallFor(!d.isMain(d.cur.path))
++	if stall <= 0 || idle < stall {
+ 		return
+ 	}
+ 	if d.fbIndex(d.cur.path) >= 0 {
+@@ -566,8 +589,8 @@ func (d *failoverDemuxer) checkStall() {
+ 
+ // silentFor is the time after which a candidate that delivers nothing is passed over.
+ func (d *failoverDemuxer) silentFor() time.Duration {
+-	if d.cfg.Stall > 0 {
+-		return d.cfg.Stall / 2
++	if stall := d.conf().stallFor(true); stall > 0 {
++		return stall / 2
+ 	}
+ 	return 1500 * time.Millisecond
+ }
+diff --git a/rtmp/failover_test.go b/rtmp/failover_test.go
+index 5a7b4bb..bc07310 100644
+--- a/rtmp/failover_test.go
++++ b/rtmp/failover_test.go
+@@ -702,3 +702,105 @@ func TestFailoverSeamlessRestart(t *testing.T) {
+ 		t.Fatalf("unexpected switches %v", switches)
+ 	}
+ }
++
++// readOnly is read, but fails as soon as a packet of the forbidden source shows up.
++func (c *chain) readOnly(want, forbid byte, n int) {
++	c.t.Helper()
++	got := 0
++	deadline := time.Now().Add(8 * time.Second)
++	for got < n {
++		if time.Now().After(deadline) {
++			c.t.Fatalf("timeout waiting for %c", want)
++		}
++		pkt, err := c.d.ReadPacket()
++		if err != nil {
++			c.t.Fatal(err)
++		}
++		switch pkt.Data[len(pkt.Data)-1] {
++		case forbid:
++			c.t.Fatalf("switched to %c", forbid)
++		case want:
++			got++
++		}
++	}
++}
++
++// A backup with gaps shorter than FallbackStall stays on air: the viewers wait for it
++// (frozen picture) instead of jumping to the slate, while a silent primary is still left
++// after Stall.
++func TestFailoverFallbackStallKeepsFlakyBackup(t *testing.T) {
++	srv, _ := New(Config{Failover: &FailoverConfig{Enable: true, Grace: 2 * time.Second, RecoverAfter: 300 * time.Millisecond, Stall: 400 * time.Millisecond, FallbackStall: 2 * time.Second}})
++	s := srv.(*server)
++	cd := codecs(t)
++
++	var stopP, stopB, stopB2, stopS atomic.Bool
++	qp := addChannel(s, "/live/ch.stream", cd)
++	qb := addChannel(s, "/live/ch_fallback.stream", cd)
++	qs := addChannel(s, "/live/ch_fallback2.stream", cd)
++	go publisher(qp, 'P', 100*time.Second, &stopP)
++	go publisher(qb, 'B', 0, &stopB)
++	go publisher(qs, 'S', 0, &stopS)
++	defer stopS.Store(true)
++	defer stopB2.Store(true)
++
++	d := newFailoverDemuxer(s, s.failover, "/live/ch.stream")
++	defer d.Close()
++	if _, err := d.Streams(); err != nil {
++		t.Fatal(err)
++	}
++	c := &chain{t: t, d: d, last: map[int8]time.Duration{}}
++
++	c.read('P', 20)
++	stopP.Store(true) // the primary goes silent: left after 400ms
++	c.readOnly('B', 'S', 20)
++
++	stopB.Store(true) // a 1s gap on the backup: longer than Stall, shorter than FallbackStall
++	go func() {
++		time.Sleep(time.Second)
++		publisher(qb, 'B', 50*time.Second, &stopB2)
++	}()
++	c.readOnly('B', 'S', 40)
++
++	stopB2.Store(true) // the backup is gone for good: the slate after FallbackStall
++	c.read('S', 20)
++}
++
++// The stall times change at run time for players that are already connected.
++func TestFailoverStallChangesAtRunTime(t *testing.T) {
++	srv, _ := New(Config{Failover: &FailoverConfig{Enable: true, Grace: 2 * time.Second, RecoverAfter: 300 * time.Millisecond, Stall: 400 * time.Millisecond}})
++	s := srv.(*server)
++	cd := codecs(t)
++
++	if st, fb := srv.FailoverStall(); st != 400*time.Millisecond || fb != 400*time.Millisecond {
++		t.Fatalf("stall %v/%v, want 400ms (fallback = primary when unset)", st, fb)
++	}
++
++	var stopP, stopB, stopB2, stopS atomic.Bool
++	qp := addChannel(s, "/live/ch.stream", cd)
++	qb := addChannel(s, "/live/ch_fallback.stream", cd)
++	qs := addChannel(s, "/live/ch_fallback2.stream", cd)
++	go publisher(qp, 'P', 100*time.Second, &stopP)
++	go publisher(qb, 'B', 0, &stopB)
++	go publisher(qs, 'S', 0, &stopS)
++	defer stopS.Store(true)
++	defer stopB2.Store(true)
++
++	d := newFailoverDemuxer(s, s.failover, "/live/ch.stream")
++	defer d.Close()
++	if _, err := d.Streams(); err != nil {
++		t.Fatal(err)
++	}
++	c := &chain{t: t, d: d, last: map[int8]time.Duration{}}
++
++	c.read('P', 20)
++	stopP.Store(true)
++	c.readOnly('B', 'S', 20)
++
++	srv.SetFailoverStall(400*time.Millisecond, 3*time.Second) // changed in the panel
++	stopB.Store(true)
++	go func() {
++		time.Sleep(time.Second)
++		publisher(qb, 'B', 50*time.Second, &stopB2)
++	}()
++	c.readOnly('B', 'S', 40)
++}
+diff --git a/rtmp/rtmp.go b/rtmp/rtmp.go
+index 6631e48..83cd30f 100644
+--- a/rtmp/rtmp.go
++++ b/rtmp/rtmp.go
+@@ -236,6 +236,13 @@ type Server interface {
+ 	// published, 0 if it is not. Seamless restarts wait on it.
+ 	PublishedFor(path string) time.Duration
+ 
++	// FailoverStall returns the silence after which the primary (stall) and a fallback
++	// (fallbackStall) count as lost.
++	FailoverStall() (stall, fallbackStall time.Duration)
++
++	// SetFailoverStall changes them at run time, also for the players that are connected.
++	SetFailoverStall(stall, fallbackStall time.Duration)
++
+ 	// SeamlessRestart reports whether players follow a process that republishes under
+ 	// NextPath (failover is on).
+ 	SeamlessRestart() bool
+@@ -251,6 +258,23 @@ func (s *server) PublishedFor(path string) time.Duration {
+ 
+ func (s *server) SeamlessRestart() bool { return s.failover.Enable }
+ 
++func (s *server) FailoverStall() (time.Duration, time.Duration) {
++	s.failoverLock.RLock()
++	defer s.failoverLock.RUnlock()
++	fallback := s.failover.FallbackStall
++	if fallback <= 0 {
++		fallback = s.failover.Stall
++	}
++	return s.failover.Stall, fallback
++}
++
++func (s *server) SetFailoverStall(stall, fallbackStall time.Duration) {
++	s.failoverLock.Lock()
++	defer s.failoverLock.Unlock()
++	s.failover.Stall = stall
++	s.failover.FallbackStall = fallbackStall
++}
++
+ // server is an implementation of the Server interface
+ type server struct {
+ 	// Configuration parameter taken from the Config
+@@ -270,7 +294,8 @@ type server struct {
+ 	channels map[string]*channel
+ 	lock     sync.RWMutex
+ 
+-	failover FailoverConfig
++	failover     FailoverConfig
++	failoverLock sync.RWMutex
+ }
+ 
+ // New creates a new RTMP server according to the given config
+@@ -627,7 +652,10 @@ func (s *server) handlePublish(conn *rtmp.Conn) {
+ func (s *server) playFailover(conn *rtmp.Conn, playPath string, ch, fb *channel) {
+ 	client := conn.NetConn().RemoteAddr()
+ 
+-	d := newFailoverDemuxer(s, s.failover, playPath)
++	s.failoverLock.RLock()
++	cfg := s.failover
++	s.failoverLock.RUnlock()
++	d := newFailoverDemuxer(s, cfg, playPath)
+ 	d.onSwitch = func(from, to string) {
+ 		s.log(log.Lwarn, "PLAY", "FAILOVER", playPath, "switched from "+from+" to "+to+" ("+d.Reason()+")", client)
+ 	}
+diff --git a/rtmp/settings.go b/rtmp/settings.go
+new file mode 100644
+index 0000000..1b4e3c6
+--- /dev/null
++++ b/rtmp/settings.go
+@@ -0,0 +1,124 @@
++package rtmp
++
++// Run-time failover settings changed in the panel (fork). They are kept in a small JSON file
++// next to the database and applied at start, over the CORE_RTMP_FAILOVER_* defaults.
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++)
++
++// FailoverSettings are the stall times in whole seconds.
++type FailoverSettings struct {
++	// StallSeconds: a connected primary that sends nothing for this long counts as lost
++	// and the viewers move to the backup. 0 = only a disconnect counts.
++	StallSeconds int `json:"stall_seconds"`
++	// FallbackStallSeconds: the same for the backup; the viewers move on to the waiting
++	// picture. A longer time rides out short gaps of a flaky backup line.
++	FallbackStallSeconds int `json:"fallback_stall_seconds"`
++}
++
++const (
++	maxStallSeconds = 60
++)
++
++func (f FailoverSettings) Validate() error {
++	if f.StallSeconds < 0 || f.StallSeconds > maxStallSeconds {
++		return fmt.Errorf("stall_seconds must be between 0 and %d", maxStallSeconds)
++	}
++	if f.FallbackStallSeconds < 1 || f.FallbackStallSeconds > maxStallSeconds {
++		return fmt.Errorf("fallback_stall_seconds must be between 1 and %d", maxStallSeconds)
++	}
++	return nil
++}
++
++// FailoverState is what the API returns.
++type FailoverState struct {
++	Enabled  bool             `json:"enabled"`
++	Current  FailoverSettings `json:"current"`
++	Defaults FailoverSettings `json:"defaults"`
++}
++
++// SettingsStore keeps the failover settings of a server.
++type SettingsStore struct {
++	path     string
++	srv      Server
++	defaults FailoverSettings
++	mu       sync.Mutex
++}
++
++func seconds(d time.Duration) int { return int((d + time.Second/2) / time.Second) }
++
++// NewSettingsStore remembers the server's current (start) values as the defaults.
++func NewSettingsStore(path string, srv Server) *SettingsStore {
++	st, fb := srv.FailoverStall()
++	return &SettingsStore{path: path, srv: srv, defaults: FailoverSettings{StallSeconds: seconds(st), FallbackStallSeconds: max(1, seconds(fb))}}
++}
++
++// Apply loads the stored settings, if there are any, and applies them.
++func (s *SettingsStore) Apply() error {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++
++	data, err := os.ReadFile(s.path)
++	if errors.Is(err, os.ErrNotExist) {
++		return nil
++	}
++	if err != nil {
++		return err
++	}
++	var f FailoverSettings
++	if err := json.Unmarshal(data, &f); err != nil {
++		return fmt.Errorf("%s: %w", s.path, err)
++	}
++	if err := f.Validate(); err != nil {
++		return fmt.Errorf("%s: %w", s.path, err)
++	}
++	s.apply(f)
++	return nil
++}
++
++func (s *SettingsStore) apply(f FailoverSettings) {
++	s.srv.SetFailoverStall(time.Duration(f.StallSeconds)*time.Second, time.Duration(f.FallbackStallSeconds)*time.Second)
++}
++
++func (s *SettingsStore) State() FailoverState {
++	st, fb := s.srv.FailoverStall()
++	return FailoverState{
++		Enabled:  s.srv.SeamlessRestart(),
++		Current:  FailoverSettings{StallSeconds: seconds(st), FallbackStallSeconds: max(1, seconds(fb))},
++		Defaults: s.defaults,
++	}
++}
++
++// Set validates, stores and applies the settings (also for connected viewers).
++func (s *SettingsStore) Set(f FailoverSettings) (FailoverState, error) {
++	if err := f.Validate(); err != nil {
++		return FailoverState{}, err
++	}
++
++	s.mu.Lock()
++	data, _ := json.MarshalIndent(f, "", "  ")
++	tmp := s.path + ".tmp"
++	err := os.MkdirAll(filepath.Dir(s.path), 0755)
++	if err == nil {
++		err = os.WriteFile(tmp, data, 0644)
++	}
++	if err == nil {
++		err = os.Rename(tmp, s.path)
++	}
++	if err == nil {
++		s.apply(f)
++	}
++	s.mu.Unlock()
++
++	if err != nil {
++		return FailoverState{}, err
++	}
++	return s.State(), nil
++}
+diff --git a/rtmp/settings_test.go b/rtmp/settings_test.go
+new file mode 100644
+index 0000000..ac3accb
+--- /dev/null
++++ b/rtmp/settings_test.go
+@@ -0,0 +1,60 @@
++package rtmp
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++)
++
++func TestFailoverSettingsStore(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "failover.json")
++	srv, _ := New(Config{Failover: &FailoverConfig{Enable: true, Stall: 3 * time.Second}})
++
++	st := NewSettingsStore(path, srv)
++	if err := st.Apply(); err != nil { // no file yet: the start values stay
++		t.Fatal(err)
++	}
++	if s := st.State(); s.Current.StallSeconds != 3 || s.Current.FallbackStallSeconds != 3 || s.Defaults.StallSeconds != 3 || !s.Enabled {
++		t.Fatalf("unexpected state %+v", s)
++	}
++
++	if _, err := st.Set(FailoverSettings{StallSeconds: 3, FallbackStallSeconds: 0}); err == nil {
++		t.Fatal("fallback 0 accepted")
++	}
++	if _, err := st.Set(FailoverSettings{StallSeconds: 61, FallbackStallSeconds: 5}); err == nil {
++		t.Fatal("stall 61 accepted")
++	}
++
++	s, err := st.Set(FailoverSettings{StallSeconds: 2, FallbackStallSeconds: 10})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if s.Current.StallSeconds != 2 || s.Current.FallbackStallSeconds != 10 || s.Defaults.FallbackStallSeconds != 3 {
++		t.Fatalf("unexpected state %+v", s)
++	}
++	if a, b := srv.FailoverStall(); a != 2*time.Second || b != 10*time.Second {
++		t.Fatalf("server not updated: %v %v", a, b)
++	}
++
++	// a restart: a new server with the env defaults, the stored file wins
++	srv2, _ := New(Config{Failover: &FailoverConfig{Enable: true, Stall: 3 * time.Second}})
++	st2 := NewSettingsStore(path, srv2)
++	if err := st2.Apply(); err != nil {
++		t.Fatal(err)
++	}
++	if a, b := srv2.FailoverStall(); a != 2*time.Second || b != 10*time.Second {
++		t.Fatalf("stored settings not applied: %v %v", a, b)
++	}
++
++	// a broken file is reported and changes nothing
++	os.WriteFile(path, []byte("{"), 0644)
++	srv3, _ := New(Config{Failover: &FailoverConfig{Enable: true, Stall: 3 * time.Second}})
++	if err := NewSettingsStore(path, srv3).Apply(); err == nil {
++		t.Fatal("broken file accepted")
++	}
++	if a, _ := srv3.FailoverStall(); a != 3*time.Second {
++		t.Fatalf("broken file changed the server: %v", a)
++	}
++}
+diff --git a/vendor/github.com/datarhei/joy4/format/rtmp/rtmp.go b/vendor/github.com/datarhei/joy4/format/rtmp/rtmp.go
+index 48f9428..7b2f33b 100644
+--- a/vendor/github.com/datarhei/joy4/format/rtmp/rtmp.go
++++ b/vendor/github.com/datarhei/joy4/format/rtmp/rtmp.go
+@@ -247,6 +247,9 @@ type Conn struct {
+ 	bufr *bufio.Reader
+ 	bufw *bufio.Writer
+ 	ackn uint32
++	// ackTotal counts all bytes received; the Acknowledgement message carries this
++	// sequence number (RTMP spec 5.4.3), not the bytes since the last one (Corvid fix).
++	ackTotal uint32
+ 
+ 	writebuf []byte
+ 	readbuf  []byte
+@@ -497,7 +500,7 @@ func (conn *Conn) pollMsg() (err error) {
+ 		}
+ 
+ 		if conn.readAckSize != 0 && conn.ackn > conn.readAckSize {
+-			if err = conn.writeAck(conn.ackn, false); err != nil {
++			if err = conn.writeAck(conn.ackTotal, false); err != nil {
+ 				return fmt.Errorf("writeACK: %w", err)
+ 			}
+ 			conn.flushWrite()
+@@ -1751,6 +1754,7 @@ func (conn *Conn) readChunk() (err error) {
+ 	}
+ 
+ 	conn.ackn += uint32(n)
++	conn.ackTotal += uint32(n) // wraps around at 4 GiB, as the spec allows
+ 
+ 	return
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,55 @@
+From 479f1d1763c94182e41165ae7b3354a827bfb699 Mon Sep 17 00:00:00 2001
+From: nvidia-fork <fork@example.invalid>
+Date: Thu, 12 Nov 2026 09:55:39 +0300
+Subject: [PATCH] cuda: enable nvcc so scale_cuda/overlay_cuda exist; fail the
+ build if they are missing
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01UhjysExATCKDyVfUWLA89B
+---
+ Dockerfile.ubuntu.cuda11 | 6 +++++-
+ Dockerfile.ubuntu.cuda12 | 4 +++-
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/Dockerfile.ubuntu.cuda11 b/Dockerfile.ubuntu.cuda11
+index 555777f..37dcde4 100644
+--- a/Dockerfile.ubuntu.cuda11
++++ b/Dockerfile.ubuntu.cuda11
+@@ -200,6 +200,8 @@ RUN cd /dist/ffmpeg-${FFMPEG_VERSION} && \
+   --enable-openssl \
+   --enable-libxml2 \
+   --enable-cuda \
++  --enable-cuda-nvcc \
++  --enable-nvdec \
+   --enable-cuvid \
+   --enable-nvenc \
+   --enable-libnpp \
+@@ -244,7 +246,9 @@ RUN echo "/ffmpeglibs" > /etc/ld.so.conf.d/ffmpeg.conf && \
+   fbset \
+   zlib1g \
+   libasound2-dev && \
+-  ffmpeg -buildconf
++  ffmpeg -buildconf && \
++  ffmpeg -hide_banner -filters | grep -E 'scale_cuda' && \
++  ffmpeg -hide_banner -filters | grep -E 'overlay_cuda'
+ 
+ ENV NVIDIA_VISIBLE_DEVICES=all
+ ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+diff --git a/Dockerfile.ubuntu.cuda12 b/Dockerfile.ubuntu.cuda12
+index 747e286..d049745 100644
+--- a/Dockerfile.ubuntu.cuda12
++++ b/Dockerfile.ubuntu.cuda12
+@@ -122,7 +122,9 @@ RUN echo "/ffmpeglibs" > /etc/ld.so.conf.d/ffmpeg.conf && \
+   ldconfig && \
+   apt-get update && \
+   apt-get install -y ca-certificates openssl tzdata v4l-utils fbset libasound2-dev && \
+-  ffmpeg -buildconf
++  ffmpeg -buildconf && \
++  ffmpeg -hide_banner -filters | grep -E 'scale_cuda' && \
++  ffmpeg -hide_banner -filters | grep -E 'overlay_cuda'
+ 
+ ENV NVIDIA_VISIBLE_DEVICES=all
+ ENV NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+-- 
+2.43.0
+
