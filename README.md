@@ -25,8 +25,8 @@ sudo IMAGE=ghcr.io/mosyokuzgun/corvid:latest bash temiz-kurulum.sh
 `IMAGE` verilmezse imaj bu depodaki yamalarla sunucuda derlenir (`build.sh`, ilk derleme 20-40 dk).
 Panel: `http://<sunucu>:4501/ui/`, RTMP `1935`, SRT `6000/udp`. Klasörler: `/opt/corvid/config`, `/opt/corvid/data`.
 
-Kurulu bir Corvid'i yeni sürüme geçirmek için Releases'teki güncelleme paketi (`update.sh` ile, aynı
-konteynerde) kullanılır; ayrıntılar `paket/BENIOKU.txt` ve `CHANGELOG.md`.
+Kurulu bir Corvid'i yeni sürüme geçirmek için güncelleme paketi (`corvid-v<sürüm>.zip`, içinde
+`update.sh`; aynı konteynerde güncellenir) kullanılır; ayrıntılar `paket/BENIOKU.txt` ve `CHANGELOG.md`.
 
 ## Depo
 
